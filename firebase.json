@@ -1,0 +1,9 @@
+{
+  "functions": [
+    {
+      "source": "functions",
+      "codebase": "lakshya-release-publisher",
+      "runtime": "nodejs20"
+    }
+  ]
+}
