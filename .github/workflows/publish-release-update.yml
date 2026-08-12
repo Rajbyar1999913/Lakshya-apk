@@ -1,0 +1,50 @@
+name: Publish Lakshya update
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  publish-update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Read release details
+        id: release
+        env:
+          RELEASE_BODY: ${{ github.event.release.body }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_DATA: ${{ toJson(github.event.release) }}
+        run: |
+          VERSION_CODE=$(printf '%s' "$RELEASE_BODY" | sed -nE 's/^[[:space:]]*versionCode:[[:space:]]*([0-9]+)[[:space:]]*$/\1/p' | head -n 1)
+          APK_URL=$(printf '%s' "$RELEASE_DATA" | jq -r '.assets[] | select(.name | endswith(".apk")) | .browser_download_url' | head -n 1)
+          if [ -z "$VERSION_CODE" ] || [ -z "$APK_URL" ] || [ "$APK_URL" = "null" ]; then
+            echo "Release body must contain a line like: versionCode: 8, and the release must include an APK asset."
+            exit 1
+          fi
+          echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
+          echo "version_name=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "apk_url=$APK_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Update Firebase and notify users
+        env:
+          RELEASE_WEBHOOK_SECRET: ${{ secrets.LAKSHYA_RELEASE_WEBHOOK_SECRET }}
+          UPDATE_FUNCTION_URL: ${{ vars.LAKSHYA_UPDATE_FUNCTION_URL }}
+          VERSION_CODE: ${{ steps.release.outputs.version_code }}
+          VERSION_NAME: ${{ steps.release.outputs.version_name }}
+          APK_URL: ${{ steps.release.outputs.apk_url }}
+        run: |
+          test -n "$RELEASE_WEBHOOK_SECRET"
+          test -n "$UPDATE_FUNCTION_URL"
+          jq -n \
+            --argjson versionCode "$VERSION_CODE" \
+            --arg versionName "$VERSION_NAME" \
+            --arg updateUrl "$APK_URL" \
+            --arg message "Lakshya $VERSION_NAME is available. Please update now." \
+            '{versionCode: $versionCode, versionName: $versionName, updateUrl: $updateUrl, message: $message}' > request.json
+          curl --fail-with-body --request POST "$UPDATE_FUNCTION_URL" \
+            --header "Authorization: Bearer $RELEASE_WEBHOOK_SECRET" \
+            --header "Content-Type: application/json" \
+            --data @request.json
