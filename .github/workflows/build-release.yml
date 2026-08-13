@@ -83,6 +83,72 @@ jobs:
           versionCode: ${VERSION_CODE}
           versionName: ${VERSION_NAME}"
 
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          credentials_json: ${{ secrets.LAKSHYA_FIREBASE_SERVICE_ACCOUNT }}
+
+      - name: Setup Google Cloud CLI
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Update Firestore App Config
+        shell: bash
+        env:
+          PROJECT_ID: lakshya-9f19f
+          VERSION_CODE: ${{ steps.version.outputs.version_code }}
+          VERSION_NAME: ${{ steps.version.outputs.version_name }}
+        run: |
+
+          APK_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION_NAME}/app-release.apk"
+
+          ACCESS_TOKEN="$(gcloud auth print-access-token)"
+
+          cat > firestore-update.json <<EOF
+          {
+            "fields": {
+              "latestVersionCode": {
+                "integerValue": "${VERSION_CODE}"
+              },
+              "minimumVersionCode": {
+                "integerValue": "${VERSION_CODE}"
+              },
+              "forceUpdate": {
+                "booleanValue": true
+              },
+              "updateMessage": {
+                "stringValue": "Lakshya ${VERSION_NAME} is available. Please update now."
+              },
+              "updateUrl": {
+                "stringValue": "${APK_URL}"
+              },
+              "appEnabled": {
+                "booleanValue": true
+              },
+              "loginEnabled": {
+                "booleanValue": true
+              },
+              "printEnabled": {
+                "booleanValue": true
+              }
+            }
+          }
+          EOF
+
+          curl --fail-with-body \
+            --request PATCH \
+            "https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/app_config/main?updateMask.fieldPaths=latestVersionCode&updateMask.fieldPaths=minimumVersionCode&updateMask.fieldPaths=forceUpdate&updateMask.fieldPaths=updateMessage&updateMask.fieldPaths=updateUrl&updateMask.fieldPaths=appEnabled&updateMask.fieldPaths=loginEnabled&updateMask.fieldPaths=printEnabled" \
+            --header "Authorization: Bearer ${ACCESS_TOKEN}" \
+            --header "Content-Type: application/json" \
+            --data @firestore-update.json
+
+          echo ""
+          echo "=========================================="
+          echo "Firebase App Config Updated Successfully"
+          echo "Version Code : ${VERSION_CODE}"
+          echo "Version Name : ${VERSION_NAME}"
+          echo "APK URL      : ${APK_URL}"
+          echo "=========================================="
+
       - name: Remove temporary signing keystore
         if: always()
         run: rm -f app/lakshya.keystore
