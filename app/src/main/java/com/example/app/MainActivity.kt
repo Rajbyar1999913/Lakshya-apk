@@ -15401,10 +15401,17 @@ fun calculateEntryChukara(
             }
 
             if (isWin) {
-                val multiplier = when (entry.entryType) {
-                    "Single" -> 9
-                    "Jodi" -> 80
-                    "Pana" -> 100
+                val chukaraAmount = when (entry.entryType) {
+                    // SINGLE AKDA ONLY:
+                    // ₹5.5 = ₹50, ₹11 = ₹100, ₹16.5 = ₹150,
+                    // ₹50 = ₹450, ₹55 = ₹500.
+                    // Formula: every ₹5.5 played gives ₹50 Chukara.
+                    "Single" ->
+                        (kotlin.math.floor(entry.actualAmount / 5.5) * 50.0).toInt()
+
+                    // JODI and PANA calculation remains exactly unchanged.
+                    "Jodi" -> entry.amount * 80
+                    "Pana" -> entry.amount * 100
                     else -> 0
                 }
                 val key = "${savedEntry.id}|$game|${entry.entryType}|${entry.number}|$index|$result"
@@ -15414,7 +15421,7 @@ fun calculateEntryChukara(
                         entryType = entry.entryType,
                         number = entry.number,
                         playedAmount = entry.amount,
-                        chukaraAmount = entry.amount * multiplier,
+                        chukaraAmount = chukaraAmount,
                         paymentKey = key
                     )
                 )
@@ -17141,5 +17148,3 @@ fun ProfitLossScreen(
         Spacer(modifier = Modifier.height(30.dp))
     }
 }
-
-
