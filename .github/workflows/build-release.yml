@@ -52,6 +52,7 @@ jobs:
         shell: bash
         run: |
           VERSION_CODE=$(sed -nE 's/.*versionCode[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' app/build.gradle.kts | head -n 1)
+
           VERSION_NAME=$(sed -nE 's/.*versionName[[:space:]]*=[[:space:]]*["'\'']([^"'\'']+)["'\''].*/\1/p' app/build.gradle.kts | head -n 1)
 
           if [ -z "$VERSION_CODE" ] || [ -z "$VERSION_NAME" ]; then
@@ -62,7 +63,10 @@ jobs:
           echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
           echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
 
-      - name: Create GitHub Release
+          echo "Version Code: $VERSION_CODE"
+          echo "Version Name: $VERSION_NAME"
+
+      - name: Create or Update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -70,18 +74,43 @@ jobs:
           VERSION_CODE="${{ steps.version.outputs.version_code }}"
           TAG="v${VERSION_NAME}"
 
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG already exists."
-            exit 1
-          fi
+          APK="app/build/outputs/apk/release/app-release.apk"
 
-          gh release create "$TAG" \
-            app/build/outputs/apk/release/app-release.apk \
-            --title "Lakshya ${VERSION_NAME}" \
-            --notes "Automatic Lakshya release.
+          echo "=========================================="
+          echo "Lakshya Release"
+          echo "Tag         : ${TAG}"
+          echo "Version Code: ${VERSION_CODE}"
+          echo "Version Name: ${VERSION_NAME}"
+          echo "APK         : ${APK}"
+          echo "=========================================="
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+
+            echo "Release ${TAG} already exists."
+            echo "Updating existing release APK..."
+
+            gh release upload "$TAG" \
+              "$APK" \
+              --clobber
+
+            echo "Existing release ${TAG} updated successfully."
+
+          else
+
+            echo "Release ${TAG} does not exist."
+            echo "Creating new GitHub release..."
+
+            gh release create "$TAG" \
+              "$APK" \
+              --title "Lakshya ${VERSION_NAME}" \
+              --notes "Automatic Lakshya release.
 
           versionCode: ${VERSION_CODE}
           versionName: ${VERSION_NAME}"
+
+            echo "New release ${TAG} created successfully."
+
+          fi
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v3
