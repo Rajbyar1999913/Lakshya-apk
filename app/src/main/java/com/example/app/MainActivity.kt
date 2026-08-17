@@ -5680,6 +5680,43 @@ fun OldDayBackupScreen(
             )
         }
 
+    val paidPrefs = remember(currentMasterUid) {
+        context.getSharedPreferences(
+            "lakshya_chukara_paid_$currentMasterUid",
+            android.content.Context.MODE_PRIVATE
+        )
+    }
+
+    var paidRefresh by remember(currentMasterUid) {
+        mutableIntStateOf(0)
+    }
+
+    DisposableEffect(currentMasterUid) {
+        if (currentMasterUid.isBlank()) {
+            onDispose { }
+        } else {
+            val paidRegistration =
+                CloudAccountSyncManager.listenChukaraPaid(
+                    masterUid = currentMasterUid,
+                    onUpdate = { paidItems ->
+                        paidPrefs.edit().apply {
+                            clear()
+                            paidItems.forEach { item ->
+                                putBoolean(item.paymentKey, true)
+                            }
+                            apply()
+                        }
+                        paidRefresh++
+                    },
+                    onError = { }
+                )
+
+            onDispose {
+                paidRegistration?.remove()
+            }
+        }
+    }
+
     var dateText by remember {
         mutableStateOf(
             SimpleDateFormat(
@@ -5866,6 +5903,8 @@ fun OldDayBackupScreen(
             it.grandTotal
         }
 
+    // Old Day / Backup P&L only includes Chukara that has actually been paid.
+    paidRefresh
     val totalChukara =
         activeEntries
             .flatMap { entry ->
@@ -5877,6 +5916,9 @@ fun OldDayBackupScreen(
                     resultPrefs =
                         resultPrefs
                 )
+            }
+            .filter { win ->
+                paidPrefs.getBoolean(win.paymentKey, false)
             }
             .sumOf {
                 it.chukaraAmount
@@ -17130,6 +17172,12 @@ fun ProfitLossScreen(
             android.content.Context.MODE_PRIVATE
         )
     }
+    val paidPrefs = remember(currentMasterUid) {
+        context.getSharedPreferences(
+            "lakshya_chukara_paid_$currentMasterUid",
+            android.content.Context.MODE_PRIVATE
+        )
+    }
 
     var resultRefresh by remember(currentMasterUid) {
         mutableIntStateOf(0)
@@ -17164,8 +17212,25 @@ fun ProfitLossScreen(
                     onError = { }
                 )
 
+            val paidRegistration =
+                CloudAccountSyncManager.listenChukaraPaid(
+                    masterUid = currentMasterUid,
+                    onUpdate = { paidItems ->
+                        paidPrefs.edit().apply {
+                            clear()
+                            paidItems.forEach { item ->
+                                putBoolean(item.paymentKey, true)
+                            }
+                            apply()
+                        }
+                        resultRefresh++
+                    },
+                    onError = { }
+                )
+
             onDispose {
                 registration?.remove()
+                paidRegistration?.remove()
             }
         }
     }
@@ -17175,7 +17240,11 @@ fun ProfitLossScreen(
 
     val activeEntries = savedEntries.filter { it.status == "ACTIVE" }
     val totalCollection = activeEntries.sumOf { it.grandTotal }
-    val allWins = activeEntries.flatMap { calculateEntryChukara(it, resultPrefs) }
+    // P/L only includes money that has actually been paid from the Chukara
+    // screen. Declared-but-unpaid winning amounts must not reduce profit.
+    val allWins = activeEntries
+        .flatMap { calculateEntryChukara(it, resultPrefs) }
+        .filter { win -> paidPrefs.getBoolean(win.paymentKey, false) }
     val totalChukara = allWins.sumOf { it.chukaraAmount }
     val netAmount = totalCollection - totalChukara
 
@@ -17223,4 +17292,3 @@ fun ProfitLossScreen(
     }
 
 }
-
