@@ -1,6 +1,7 @@
 package com.example.app
 
 import android.os.Build
+import android.icu.text.Transliterator
 
 import androidx.compose.runtime.rememberCoroutineScope
 import android.os.Bundle
@@ -12515,6 +12516,7 @@ fun NewEntryScreen(
     var quickPanaAmount by remember { mutableStateOf("") }
     var quickPanaTypeMenuExpanded by remember { mutableStateOf(false) }
     var quickPanaAnkMenuExpanded by remember { mutableStateOf(false) }
+    var entryTypeRequiredHint by remember { mutableStateOf(false) }
 
 
     val context =
@@ -12896,37 +12898,6 @@ fun NewEntryScreen(
         )
 
 
-        Text(
-            text = "Entry Type",
-            fontSize = 17.sp
-        )
-
-
-        Spacer(
-            modifier = Modifier.height(5.dp)
-        )
-
-
-        Text(
-            text =
-                "S / SINGLE = Single",
-            fontSize = 14.sp
-        )
-
-
-        Text(
-            text =
-                "J / JODI = Jodi",
-            fontSize = 14.sp
-        )
-
-
-        Text(
-            text =
-                "P / PANA / PANE = Pana",
-            fontSize = 14.sp
-        )
-
         // Chart controls are compact dropdowns so the entry screen stays clean.
         Spacer(modifier = Modifier.height(12.dp))
         Text(text = "Quick Pana Chart", fontSize = 17.sp)
@@ -12988,9 +12959,15 @@ fun NewEntryScreen(
                 rawEntry,
 
             onValueChange = {
-
-                rawEntry =
-                    it.uppercase()
+                val updatedEntry = it.uppercase()
+                if (canEnterNumbersWithEntryType(updatedEntry)) {
+                    rawEntry = updatedEntry
+                    entryTypeRequiredHint = false
+                } else {
+                    // Do not let a number be entered until the employee first
+                    // writes S, J or P on its own line.
+                    entryTypeRequiredHint = true
+                }
 
             },
 
@@ -13026,6 +13003,8 @@ fun NewEntryScreen(
             supportingText = {
                 if (!isEntrySaved && !canEnterNumbers) {
                     Text("Entry likhne se pehle Customer Name aur valid Game Code bharein.")
+                } else if (entryTypeRequiredHint) {
+                    Text("Pehle S, J ya P likhkar next line mein number daalein.")
                 }
             },
 
@@ -13061,31 +13040,6 @@ fun NewEntryScreen(
 
         Spacer(
             modifier = Modifier.height(10.dp)
-        )
-
-
-        Text(
-            text =
-                "Short Form Example:",
-            fontSize = 14.sp
-        )
-
-
-        Text(
-            text = "S → 1 3 5=20",
-            fontSize = 14.sp
-        )
-
-
-        Text(
-            text = "J → 12 32 58=50",
-            fontSize = 14.sp
-        )
-
-
-        Text(
-            text = "P → 123 456 890=100",
-            fontSize = 14.sp
         )
 
 
@@ -14462,6 +14416,29 @@ fun isValidPana(
 // MIXED ENTRY PARSER
 // =====================================================
 
+// New Entry keeps the type explicit so an employee cannot accidentally add
+// numbers under the wrong category.  S/J/P (or their full names) must appear
+// on a line before a line containing digits is accepted.
+fun canEnterNumbersWithEntryType(entryText: String): Boolean {
+    var currentTypeSelected = false
+
+    entryText.uppercase().lines().forEach { sourceLine ->
+        val line = sourceLine.trim()
+        when (line) {
+            "S", "SINGLE", "J", "JODI", "P", "PANA", "PANE" -> {
+                currentTypeSelected = true
+            }
+            else -> {
+                if (line.any { it.isDigit() } && !currentTypeSelected) {
+                    return false
+                }
+            }
+        }
+    }
+
+    return true
+}
+
 fun parseMixedEntries(
     rawEntry: String
 ): MixedParseResult {
@@ -14488,6 +14465,12 @@ fun parseMixedEntries(
             originalLine.trim()
 
         if (line.isBlank()) {
+            return@forEach
+        }
+
+        // Accidental punctuation-only lines should not block an otherwise
+        // valid entry pasted or typed into the field.
+        if (line.all { it == ',' || it == '.' }) {
             return@forEach
         }
 
@@ -14531,20 +14514,16 @@ fun parseMixedEntries(
             return@forEach
         }
 
-        val cleanedLine =
-            line.replace(
-                ",",
-                " "
-            )
-
         val groupRegex =
             Regex(
-                """((?:\d+\s*)+?)\s*=\s*(\d+(?:\.5)?)"""
+                // Comma and dot separators on the number side are optional.
+                // The amount stays separate, so values such as 100.5 still work.
+                """((?:[\d\s,.])+?)\s*=\s*(\d+(?:\.5)?)"""
             )
 
         val matches =
             groupRegex
-                .findAll(cleanedLine)
+                .findAll(line)
                 .toList()
 
         if (matches.isEmpty()) {
@@ -14572,14 +14551,36 @@ fun parseMixedEntries(
                 return@forEach
             }
 
-            val numbers =
+            val enteredNumbers =
                 numbersPart
                     .split(
-                        Regex("\\s+")
+                        Regex("[\\s,.]+")
                     )
                     .filter {
                         it.isNotBlank()
                     }
+
+            // A compact input is convenient on mobile: S + 123456=100 means
+            // 1, 2, 3, 4, 5 and 6 at Rs.100 each.  The same rule makes
+            // J + 123456=100 become 12, 34, 56 and P + 123456=100 become
+            // 123, 456.  Commas/dots between numbers are ignored above.
+            val numberSize = when (currentType) {
+                "Single" -> 1
+                "Jodi" -> 2
+                "Pana" -> 3
+                else -> Int.MAX_VALUE
+            }
+            val numbers = enteredNumbers.flatMap { enteredNumber ->
+                if (
+                    numberSize != Int.MAX_VALUE &&
+                    enteredNumber.length > numberSize &&
+                    enteredNumber.length % numberSize == 0
+                ) {
+                    enteredNumber.chunked(numberSize)
+                } else {
+                    listOf(enteredNumber)
+                }
+            }
 
             val validNumbers = numbers.filter { number ->
 
@@ -14758,6 +14759,16 @@ fun deserializeEntries(
 // BUILD RECEIPT
 // =====================================================
 
+private fun hindiSlipCustomerName(name: String): String {
+    return try {
+        Transliterator.getInstance("Latin-Devanagari").transliterate(name)
+    } catch (_: Exception) {
+        // The original name is safer than failing the receipt if a device does
+        // not provide the ICU transliterator.
+        name
+    }
+}
+
 fun buildReceiptText(
 
     customerName: String,
@@ -14796,17 +14807,14 @@ fun buildReceiptText(
 
 
     receipt.appendLine(
-        "Customer: $customerName"
+        "Customer: ${hindiSlipCustomerName(customerName)}"
     )
 
 
     receipt.appendLine(
 
         "Games: ${
-            selectedGames
-                .joinToString(
-                    ", "
-                )
+            selectedGames.joinToString(", ")
         }"
 
     )
@@ -15109,17 +15117,35 @@ fun GameWiseLimitScreen(
             ) {
                 rowGames.forEach { game ->
 
+                    val isSelected = game == selectedGame
+
                     Button(
                         onClick = {
                             selectedGame = game
                         },
                         modifier = Modifier
                             .weight(1f)
-                            .padding(3.dp)
+                            .padding(3.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            // Active game is shown in the app's gold accent;
+                            // all other games remain muted, so the selection is
+                            // immediately clear after every tap.
+                            containerColor = if (isSelected) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.surfaceVariant
+                            },
+                            contentColor = if (isSelected) {
+                                MaterialTheme.colorScheme.onPrimary
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            }
+                        )
                     ) {
                         Text(
                             text = game,
-                            fontSize = 12.sp
+                            fontSize = 12.sp,
+                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
                         )
                     }
                 }
@@ -17195,4 +17221,6 @@ fun ProfitLossScreen(
         }
         Spacer(modifier = Modifier.height(30.dp))
     }
+
 }
+
