@@ -29,6 +29,7 @@ import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.draw.clip
@@ -5488,21 +5489,9 @@ fun calculateHistoricalChukara(
         return emptyList()
     }
 
-    // Keep the same print-security rule as current Chukara.
-    val securityStartTime =
-        resultPrefs.getLong(
-            "PRINT_SECURITY_START_TIME",
-            Long.MAX_VALUE
-        )
-
-    val isLegacyEntry =
-        savedEntry.savedTime <
-                securityStartTime
-
-    if (
-        !savedEntry.isPrinted &&
-        !isLegacyEntry
-    ) {
+    // A chukara can only be paid against a printed receipt, including old
+    // records.  Legacy exemptions let unprinted slips appear as payable.
+    if (!savedEntry.isPrinted) {
         return emptyList()
     }
 
@@ -11233,11 +11222,16 @@ fun SearchReportsScreen(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Text(
-                            text = "#$slipId  $customerName",
-                            fontSize = 16.sp,
-                            modifier = Modifier.weight(1f)
-                        )
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "#$slipId  $customerName",
+                                fontSize = 16.sp
+                            )
+                            Text(
+                                text = "Game: ${allWins.map { it.game }.distinct().joinToString(", ")}",
+                                fontSize = 12.sp
+                            )
+                        }
                         Text(
                             text = "₹$totalChukara",
                             fontSize = 16.sp,
@@ -14945,6 +14939,7 @@ fun GameWiseLimitScreen(
     var selectedGame by remember {
         mutableStateOf("MO")
     }
+    var detailToShow by remember { mutableStateOf<String?>(null) }
 
     val activeEntries =
         savedEntries.filter {
@@ -15009,6 +15004,27 @@ fun GameWiseLimitScreen(
                 jodiTotals.sumOf { it.second } +
                 panaTotals.sumOf { it.second }
 
+    // Har selected game ka customer-wise kaam aur winning Chukara.  Ek slip
+    // ke entries uske har selected game me count hote hain.
+    val workByCustomer = activeEntries
+        .groupBy { it.customerName }
+        .map { (customer, slips) ->
+            customer to slips.sumOf { slip -> slip.entries.sumOf { it.amount } }
+        }
+        .sortedByDescending { it.second }
+
+    val chukaraByCustomer = activeEntries
+        .flatMap { slip ->
+            calculateEntryChukara(slip, resultPrefs)
+                .filter { it.game == selectedGame }
+                .map { win -> slip.customerName to win.chukaraAmount }
+        }
+        .groupBy { it.first }
+        .map { (customer, items) -> customer to items.sumOf { it.second } }
+        .sortedByDescending { it.second }
+
+    val totalChukara = chukaraByCustomer.sumOf { it.second }
+
     // Jodi 12=100 adds ₹100 to open digit 1 and ₹800 (8x risk) to close digit 2.
     val combinedLimitTotals =
         (0..9).associate { digit ->
@@ -15060,10 +15076,27 @@ fun GameWiseLimitScreen(
             fontSize = 16.sp
         )
 
-        Text(
-            text = "Total Amount: ₹$totalAmount",
-            fontSize = 18.sp
-        )
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(modifier = Modifier.padding(12.dp)) {
+                Text(text = "TOTAL KAAM", fontSize = 14.sp)
+                Text(
+                    text = "₹$totalAmount  (tap for customer details)",
+                    fontSize = 20.sp,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { detailToShow = "WORK" }
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(text = "TOTAL CHUKARA", fontSize = 14.sp)
+                Text(
+                    text = "₹$totalChukara  (tap for customer details)",
+                    fontSize = 20.sp,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { detailToShow = "CHUKARA" }
+                )
+            }
+        }
 
         Spacer(
             modifier = Modifier.height(14.dp)
@@ -15235,6 +15268,34 @@ fun GameWiseLimitScreen(
             modifier = Modifier.height(25.dp)
         )
     }
+
+    detailToShow?.let { detailType ->
+        val isWorkDetail = detailType == "WORK"
+        val details = if (isWorkDetail) workByCustomer else chukaraByCustomer
+        AlertDialog(
+            onDismissRequest = { detailToShow = null },
+            title = {
+                Text(
+                    text = "$selectedGame ${if (isWorkDetail) "KAAM" else "CHUKARA"} DETAILS"
+                )
+            },
+            text = {
+                Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                    if (details.isEmpty()) {
+                        Text("Koi record nahi hai")
+                    } else {
+                        details.forEach { (customer, amount) ->
+                            Text("$customer  =  ₹$amount", fontSize = 16.sp)
+                            Spacer(modifier = Modifier.height(6.dp))
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { detailToShow = null }) { Text("CLOSE") }
+            }
+        )
+    }
 }
 
 
@@ -15273,22 +15334,9 @@ fun calculateEntryChukara(
 ): List<WinningChukara> {
     if (savedEntry.status != "ACTIVE") return emptyList()
 
-    // BACKWARD COMPATIBILITY + NEW PRINT SECURITY
-    // Existing old slips were migrated with isPrinted = false.
-    // On the first Chukara calculation after this security update,
-    // remember the activation time. Entries created before that time
-    // remain eligible like before; entries created after that time
-    // must be PRINTED before they can receive Chukara.
-    var securityStartTime = resultPrefs.getLong("PRINT_SECURITY_START_TIME", 0L)
-    if (securityStartTime == 0L) {
-        securityStartTime = System.currentTimeMillis()
-        resultPrefs.edit()
-            .putLong("PRINT_SECURITY_START_TIME", securityStartTime)
-            .apply()
-    }
-
-    val isLegacyEntry = savedEntry.savedTime < securityStartTime
-    if (!savedEntry.isPrinted && !isLegacyEntry) return emptyList()
+    // A chukara can only be paid against a printed receipt.  This applies to
+    // old records too, so an unprinted legacy slip never becomes payable.
+    if (!savedEntry.isPrinted) return emptyList()
 
     val wins = mutableListOf<WinningChukara>()
 
