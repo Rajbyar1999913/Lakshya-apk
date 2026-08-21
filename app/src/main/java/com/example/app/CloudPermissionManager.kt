@@ -53,22 +53,25 @@ object CloudPermissionManager {
             it.key.trim().uppercase()
         }
 
-        val data = hashMapOf<String, Any>(
+        val now = System.currentTimeMillis()
+
+        val masterPermissionData = hashMapOf<String, Any>(
             "masterUid" to cleanMasterUid,
             "employeeUserId" to cleanUserId,
             "permissions" to cleanPermissions,
-            "updatedAt" to System.currentTimeMillis()
+            "updatedAt" to now
         )
 
         permissionDocument(
             cleanMasterUid,
             cleanUserId
         )
-            .set(data)
+            .set(masterPermissionData)
             .addOnSuccessListener {
-                // An employee is allowed to read only their own lookup document.
-                // Keep a copy here as well, so permissions work on a different phone
-                // without granting the employee broad access to the master's data.
+
+                // Keep the exact same permission map in the employee's
+                // already-authorized lookup document. The employee-side
+                // real-time listener watches this document.
                 firestore
                     .collection("masters")
                     .document(cleanMasterUid)
@@ -77,30 +80,45 @@ object CloudPermissionManager {
                     .limit(1)
                     .get()
                     .addOnSuccessListener { employees ->
-                        val employeeUid = employees.documents.firstOrNull()?.id
+
+                        val employeeUid =
+                            employees.documents.firstOrNull()?.id
 
                         if (employeeUid.isNullOrBlank()) {
-                            onError("Employee profile not found for permission sync")
+                            onError(
+                                "Employee profile not found for permission sync"
+                            )
                             return@addOnSuccessListener
                         }
+
+                        val employeeLookupData =
+                            mapOf<String, Any>(
+                                "permissions" to cleanPermissions,
+                                "permissionsUpdatedAt" to now
+                            )
 
                         firestore
                             .collection("employee_lookup")
                             .document(employeeUid)
                             .set(
-                                mapOf(
-                                    "permissions" to cleanPermissions,
-                                    "permissionsUpdatedAt" to System.currentTimeMillis()
-                                ),
+                                employeeLookupData,
                                 SetOptions.merge()
                             )
-                            .addOnSuccessListener { onSuccess() }
+                            .addOnSuccessListener {
+                                onSuccess()
+                            }
                             .addOnFailureListener {
-                                onError(it.message ?: "Employee permission sync failed")
+                                onError(
+                                    it.message
+                                        ?: "Employee permission sync failed"
+                                )
                             }
                     }
                     .addOnFailureListener {
-                        onError(it.message ?: "Employee profile lookup failed")
+                        onError(
+                            it.message
+                                ?: "Employee profile lookup failed"
+                        )
                     }
             }
             .addOnFailureListener {
@@ -175,16 +193,27 @@ object CloudPermissionManager {
     }
 
     /**
-     * Employee-side listener. employee_lookup/{uid} is already used during
-     * login and is readable only by that authenticated employee in Firestore
-     * rules, unlike a master-owned subcollection on another device.
+     * Employee-side listener.
+     *
+     * employee_lookup/{uid} is already used during login and is readable
+     * only by that authenticated employee in Firestore rules.
+     *
+     * IMPORTANT:
+     * The permissions map is read directly from this same document on every
+     * Firebase snapshot. Therefore Master OFF/ON changes are delivered to the
+     * already logged-in employee in real time.
      */
     fun getPermissionsForSignedInEmployee(
         onSuccess: (Map<String, Boolean>) -> Unit,
         onError: (String) -> Unit,
         onAccessRevoked: () -> Unit
     ): ListenerRegistration? {
-        val employeeUid = FirebaseAuth.getInstance().currentUser?.uid.orEmpty()
+
+        val employeeUid =
+            FirebaseAuth.getInstance()
+                .currentUser
+                ?.uid
+                .orEmpty()
 
         if (employeeUid.isBlank()) {
             onError("Employee login missing")
@@ -195,34 +224,72 @@ object CloudPermissionManager {
             .collection("employee_lookup")
             .document(employeeUid)
             .addSnapshotListener { document, error ->
+
                 if (error != null) {
-                    onError(error.message ?: "Employee permission sync failed")
+                    onError(
+                        error.message
+                            ?: "Employee permission sync failed"
+                    )
                     return@addSnapshotListener
                 }
 
-                // The master updates this same document whenever an employee
-                // is activated/deactivated.  A missing or inactive document
-                // must revoke an already logged-in employee as well.
-                val employeeIsActive =
-                    document?.getBoolean("isActive")
-                        ?: document?.getBoolean("active")
-                        ?: false
-                if (document == null || !document.exists() || !employeeIsActive) {
+                val snapshot = document
+
+                if (
+                    snapshot == null ||
+                    !snapshot.exists()
+                ) {
                     onAccessRevoked()
                     return@addSnapshotListener
                 }
 
-                val raw = document?.get("permissions") as? Map<*, *>
-                    ?: emptyMap<Any, Any>()
-                val result = HashMap<String, Boolean>()
+                val employeeIsActive =
+                    snapshot.getBoolean("isActive")
+                        ?: snapshot.getBoolean("active")
+                        ?: false
+
+                if (!employeeIsActive) {
+                    onAccessRevoked()
+                    return@addSnapshotListener
+                }
+
+                val raw =
+                    snapshot.get("permissions")
+                            as? Map<*, *>
+                        ?: emptyMap<Any, Any>()
+
+                val result =
+                    HashMap<String, Boolean>()
 
                 raw.forEach { (key, value) ->
-                    val feature = key?.toString()?.trim()?.uppercase()
-                    if (feature != null && value is Boolean) {
+
+                    val feature =
+                        key?.toString()
+                            ?.trim()
+                            ?.uppercase()
+
+                    if (
+                        feature != null &&
+                        value is Boolean
+                    ) {
                         result[feature] = value
                     }
                 }
+
+                /*
+                 * IMPORTANT:
+                 * Do not cache or reuse an old permission value here.
+                 * Every Firebase snapshot replaces the complete current map.
+                 *
+                 * false is preserved exactly:
+                 * EDIT_ENTRY=false  -> Employee receives false
+                 * CANCEL_ENTRY=false -> Employee receives false
+                 * EXCEL_EXPORT=false -> Employee receives false
+                 *
+                 * true is also preserved exactly when Master turns it back ON.
+                 */
                 onSuccess(result)
             }
     }
 }
+    

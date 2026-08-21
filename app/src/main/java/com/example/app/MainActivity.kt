@@ -347,6 +347,154 @@ data class PrintPreviewData(
 
 
 // =====================================================
+// CHUKARA RATE - MASTER CONTROL + REAL-TIME SYNC
+// =====================================================
+
+data class ChukaraRateConfig(
+    val enabled: Boolean = true,
+    val singleRate: Int = 9,
+    val jodiRate: Int = 8,
+    val panaRate: Int = 10
+)
+
+object ChukaraRateRuntime {
+    @Volatile
+    var config: ChukaraRateConfig = ChukaraRateConfig()
+
+    @Volatile
+    var employeeRateAllowed: Boolean = true
+}
+
+object ChukaraRateManager {
+    private val firestore by lazy {
+        com.google.firebase.firestore.FirebaseFirestore.getInstance()
+    }
+
+    private fun document(masterUid: String) =
+        firestore.collection("masters")
+            .document(masterUid)
+            .collection("settings")
+            .document("chukara_rate")
+
+    fun saveRateConfig(
+        masterUid: String,
+        config: ChukaraRateConfig,
+        onSuccess: () -> Unit = {},
+        onError: (String) -> Unit = {}
+    ) {
+        if (masterUid.isBlank()) {
+            onError("Master UID missing")
+            return
+        }
+
+        document(masterUid)
+            .set(
+                mapOf(
+                    "enabled" to config.enabled,
+                    "singleRate" to config.singleRate,
+                    "jodiRate" to config.jodiRate,
+                    "panaRate" to config.panaRate,
+                    "updatedAt" to System.currentTimeMillis()
+                ),
+                com.google.firebase.firestore.SetOptions.merge()
+            )
+            .addOnSuccessListener { onSuccess() }
+            .addOnFailureListener {
+                onError(it.message ?: "Unable to save Chukara Rate")
+            }
+    }
+
+    fun listenRateConfig(
+        masterUid: String,
+        onUpdate: (ChukaraRateConfig) -> Unit,
+        onError: (String) -> Unit = {}
+    ): com.google.firebase.firestore.ListenerRegistration? {
+        if (masterUid.isBlank()) {
+            onUpdate(ChukaraRateConfig())
+            return null
+        }
+
+        return document(masterUid)
+            .addSnapshotListener { snapshot, error ->
+                if (error != null) {
+                    onError(error.message ?: "Chukara Rate sync error")
+                    return@addSnapshotListener
+                }
+
+                if (snapshot == null || !snapshot.exists()) {
+                    val defaultConfig = ChukaraRateConfig()
+                    ChukaraRateRuntime.config = defaultConfig
+                    onUpdate(defaultConfig)
+                    return@addSnapshotListener
+                }
+
+                val config = ChukaraRateConfig(
+                    enabled = snapshot.getBoolean("enabled") ?: true,
+                    singleRate = (snapshot.getLong("singleRate") ?: 9L)
+                        .toInt().coerceIn(9, 10),
+                    jodiRate = (snapshot.getLong("jodiRate") ?: 8L)
+                        .toInt().coerceAtLeast(8),
+                    panaRate = (snapshot.getLong("panaRate") ?: 10L)
+                        .toInt().coerceAtLeast(8)
+                )
+
+                ChukaraRateRuntime.config = config
+                onUpdate(config)
+            }
+    }
+}
+
+private fun calculateRate9Single(actualAmount: Double): Int {
+    // RATE 9 — EXACT MASTER FORMULA:
+    // If amount is a multiple of 5.5, use amount / 11 * 100.
+    // Otherwise use amount * 9.
+    // Examples: 1 -> 9, 5 -> 45, 5.5 -> 50,
+    // 11 -> 100, 16.5 -> 150, 22 -> 200.
+    val remainder = actualAmount % 5.5
+    val isMultipleOfFivePointFive =
+        kotlin.math.abs(remainder) < 0.000001 ||
+                kotlin.math.abs(remainder - 5.5) < 0.000001
+
+    return if (isMultipleOfFivePointFive) {
+        kotlin.math.round(actualAmount / 11.0 * 100.0).toInt()
+    } else {
+        kotlin.math.round(actualAmount * 9.0).toInt()
+    }
+}
+
+private fun calculateConfiguredChukara(entry: NumberAmountEntry): Int {
+    val config = ChukaraRateRuntime.config
+
+    // OFF = existing Chukara calculation.
+    if (!config.enabled || !ChukaraRateRuntime.employeeRateAllowed) {
+        return when (entry.entryType) {
+            "Single" -> calculateRate9Single(entry.actualAmount)
+            "Jodi" -> entry.amount * 80
+            "Pana" -> entry.amount * 100
+            else -> 0
+        }
+    }
+
+    return when (entry.entryType) {
+        "Single" -> {
+            if (config.singleRate == 9) {
+                calculateRate9Single(entry.actualAmount)
+            } else {
+                // Single rate 10: any amount × 10.
+                (entry.actualAmount * 10.0).toInt()
+            }
+        }
+
+        "Jodi" -> entry.amount * config.jodiRate * 10
+
+        "Pana" -> entry.amount * config.panaRate * 10
+
+        else -> 0
+    }
+}
+
+
+// =====================================================
 // SUPER MASTER + CLOUD DIRECTORY
 // =====================================================
 
@@ -1077,6 +1225,277 @@ object CloudPaymentManager {
     }
 }
 
+
+// =====================================================
+// 2048 DECOY / HIDDEN LAKSHYA UNLOCK
+// =====================================================
+// Change this one value if you want a different hidden password.
+private const val LAKSHYA_HIDDEN_PASSWORD = "Lakshya2048"
+
+private fun new2048Board(): List<Int> {
+    val board = MutableList(16) { 0 }
+    add2048Tile(board)
+    add2048Tile(board)
+    return board
+}
+
+private fun add2048Tile(board: MutableList<Int>) {
+    val empty = board.indices.filter { board[it] == 0 }
+    if (empty.isEmpty()) return
+    val index = empty.random()
+    board[index] = if (kotlin.random.Random.nextFloat() < 0.9f) 2 else 4
+}
+
+private fun move2048(board: List<Int>, direction: Int): Pair<List<Int>, Int> {
+    // direction: 0=left, 1=right, 2=up, 3=down
+    val working = board.toMutableList()
+    var gained = 0
+
+    fun slide(values: List<Int>): List<Int> {
+        val compact = values.filter { it != 0 }.toMutableList()
+        val result = mutableListOf<Int>()
+        var i = 0
+        while (i < compact.size) {
+            if (i + 1 < compact.size && compact[i] == compact[i + 1]) {
+                val merged = compact[i] * 2
+                result.add(merged)
+                gained += merged
+                i += 2
+            } else {
+                result.add(compact[i])
+                i++
+            }
+        }
+        while (result.size < 4) result.add(0)
+        return result
+    }
+
+    when (direction) {
+        0, 1 -> {
+            for (r in 0 until 4) {
+                val row = (0 until 4).map { working[r * 4 + it] }
+                val source = if (direction == 0) row else row.reversed()
+                val moved = slide(source)
+                val finalRow = if (direction == 0) moved else moved.reversed()
+                for (c in 0 until 4) working[r * 4 + c] = finalRow[c]
+            }
+        }
+        2, 3 -> {
+            for (c in 0 until 4) {
+                val column = (0 until 4).map { working[it * 4 + c] }
+                val source = if (direction == 2) column else column.reversed()
+                val moved = slide(source)
+                val finalColumn = if (direction == 2) moved else moved.reversed()
+                for (r in 0 until 4) working[r * 4 + c] = finalColumn[r]
+            }
+        }
+    }
+
+    if (working != board) add2048Tile(working)
+    return working to gained
+}
+
+private fun canMove2048(board: List<Int>): Boolean {
+    if (board.any { it == 0 }) return true
+    for (r in 0 until 4) {
+        for (c in 0 until 4) {
+            val value = board[r * 4 + c]
+            if (c < 3 && board[r * 4 + c + 1] == value) return true
+            if (r < 3 && board[(r + 1) * 4 + c] == value) return true
+        }
+    }
+    return false
+}
+
+@Composable
+fun Game2048Screen(
+    onUnlocked: () -> Unit
+) {
+    var board by remember { mutableStateOf(new2048Board()) }
+    var score by remember { mutableIntStateOf(0) }
+    var titleTapCount by remember { mutableIntStateOf(0) }
+    var showPasswordDialog by remember { mutableStateOf(false) }
+    var password by remember { mutableStateOf("") }
+    var passwordError by remember { mutableStateOf(false) }
+    var gameOver by remember { mutableStateOf(false) }
+
+    fun performMove(direction: Int) {
+        if (gameOver) return
+        val (newBoard, gained) = move2048(board, direction)
+        if (newBoard != board) {
+            board = newBoard
+            score += gained
+            gameOver = !canMove2048(newBoard)
+        }
+    }
+
+    fun resetGame() {
+        board = new2048Board()
+        score = 0
+        gameOver = false
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFFFAF8EF))
+            .padding(18.dp)
+    ) {
+        Column(
+            modifier = Modifier.fillMaxSize(),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Spacer(modifier = Modifier.height(22.dp))
+
+            // Seven taps on the title open the password dialog.
+            Text(
+                text = "2048",
+                fontSize = 48.sp,
+                fontWeight = FontWeight.Black,
+                color = Color(0xFF776E65),
+                modifier = Modifier.clickable {
+                    titleTapCount++
+                    if (titleTapCount >= 7) {
+                        titleTapCount = 0
+                        password = ""
+                        passwordError = false
+                        showPasswordDialog = true
+                    }
+                }
+            )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text("SCORE", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color(0xFF776E65))
+                    Text(score.toString(), fontSize = 22.sp, fontWeight = FontWeight.Bold, color = Color(0xFF776E65))
+                }
+                Button(onClick = { resetGame() }) {
+                    Text("NEW GAME")
+                }
+            }
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFBBADA0))
+            ) {
+                Column(modifier = Modifier.padding(7.dp)) {
+                    for (r in 0 until 4) {
+                        Row(modifier = Modifier.fillMaxWidth()) {
+                            for (c in 0 until 4) {
+                                val value = board[r * 4 + c]
+                                Box(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .aspectRatio(1f)
+                                        .padding(4.dp)
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(if (value == 0) Color(0xFFCDC1B4) else Color(0xFFEEE4DA)),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    if (value != 0) {
+                                        Text(
+                                            text = value.toString(),
+                                            fontSize = if (value >= 1000) 24.sp else 30.sp,
+                                            fontWeight = FontWeight.Black,
+                                            color = Color(0xFF776E65),
+                                            textAlign = TextAlign.Center
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = { performMove(0) }) { Text("←") }
+                Button(onClick = { performMove(2) }) { Text("↑") }
+                Button(onClick = { performMove(3) }) { Text("↓") }
+                Button(onClick = { performMove(1) }) { Text("→") }
+            }
+
+            Spacer(modifier = Modifier.height(14.dp))
+            Text(
+                text = if (gameOver) "GAME OVER — TAP NEW GAME" else "Join the numbers and get to 2048!",
+                fontSize = 14.sp,
+                color = Color(0xFF776E65),
+                fontWeight = FontWeight.Medium,
+                textAlign = TextAlign.Center
+            )
+
+            Spacer(modifier = Modifier.weight(1f))
+            Text(
+                text = "2048",
+                fontSize = 12.sp,
+                color = Color(0xFFAAA29A)
+            )
+        }
+    }
+
+    if (showPasswordDialog) {
+        AlertDialog(
+            onDismissRequest = {
+                showPasswordDialog = false
+                password = ""
+                passwordError = false
+            },
+            title = { Text("Enter Password") },
+            text = {
+                Column {
+                    OutlinedTextField(
+                        value = password,
+                        onValueChange = {
+                            password = it
+                            passwordError = false
+                        },
+                        label = { Text("Password") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password)
+                    )
+                    if (passwordError) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text("Wrong password", color = MaterialTheme.colorScheme.error, fontSize = 13.sp)
+                    }
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    if (password == LAKSHYA_HIDDEN_PASSWORD) {
+                        showPasswordDialog = false
+                        password = ""
+                        passwordError = false
+                        onUnlocked()
+                    } else {
+                        passwordError = true
+                    }
+                }) {
+                    Text("UNLOCK")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    showPasswordDialog = false
+                    password = ""
+                    passwordError = false
+                }) {
+                    Text("CANCEL")
+                }
+            }
+        )
+    }
+}
+
 // =====================================================
 // MAIN APP
 // =====================================================
@@ -1084,8 +1503,10 @@ object CloudPaymentManager {
 @Composable
 fun LakshyaApp() {
 
+    // App opens into the offline 2048 decoy game.
+    // The real Lakshya login is unlocked from the hidden password dialog.
     var currentScreen by remember {
-        mutableStateOf("welcome")
+        mutableStateOf("game2048")
     }
 
     var currentUserId by remember {
@@ -1212,6 +1633,11 @@ fun LakshyaApp() {
                         currentEmployeePermissions[feature.key] =
                             cloudPermissions[feature.key] ?: true
                     }
+
+                    ChukaraRateRuntime.employeeRateAllowed =
+                        currentUserRole != "EMPLOYEE" ||
+                                currentEmployeePermissions["CHUKARA_RATE"] != false
+
                     coroutineScope.launch {
                         val rows = EMPLOYEE_FEATURE_OPTIONS.map { feature ->
                             EmployeePermissionEntity(
@@ -1292,6 +1718,49 @@ fun LakshyaApp() {
                 registration?.remove()
             }
         }
+    }
+
+    // =====================================================
+    // REAL-TIME CHUKARA RATE
+    // Same masterUid = same rate on Master + Employee devices.
+    // =====================================================
+    var chukaraRateRefresh by remember {
+        mutableIntStateOf(0)
+    }
+
+    DisposableEffect(currentMasterUid, currentUserRole, currentUserId) {
+        if (currentMasterUid.isBlank()) {
+            ChukaraRateRuntime.config = ChukaraRateConfig()
+            ChukaraRateRuntime.employeeRateAllowed = true
+            onDispose { }
+        } else {
+            val registration =
+                ChukaraRateManager.listenRateConfig(
+                    masterUid = currentMasterUid,
+                    onUpdate = { config ->
+                        ChukaraRateRuntime.config = config
+                        ChukaraRateRuntime.employeeRateAllowed =
+                            currentUserRole != "EMPLOYEE" ||
+                                    currentEmployeePermissions["CHUKARA_RATE"] != false
+                        chukaraRateRefresh++
+                    },
+                    onError = { /* Keep last known rate if temporarily offline. */ }
+                )
+
+            onDispose {
+                registration?.remove()
+            }
+        }
+    }
+
+    LaunchedEffect(
+        currentUserRole,
+        currentEmployeePermissions["CHUKARA_RATE"]
+    ) {
+        chukaraRateRefresh
+        ChukaraRateRuntime.employeeRateAllowed =
+            currentUserRole != "EMPLOYEE" ||
+                    currentEmployeePermissions["CHUKARA_RATE"] != false
     }
 
     fun currentBusinessDayStart(): Long {
@@ -1527,6 +1996,7 @@ fun LakshyaApp() {
     // Mobile system BACK button / gesture support.
     BackHandler(enabled = currentScreen != "login") {
         when (currentScreen) {
+            "game2048" -> showExitDialog = true
             "adminDashboard", "dashboard" -> showExitDialog = true
             "printPreview" -> currentScreen = printPreviewReturnScreen
             "editEntry" -> {
@@ -1557,6 +2027,32 @@ fun LakshyaApp() {
     }
 
     when (currentScreen) {
+
+        "game2048" -> {
+            Game2048Screen(
+                onUnlocked = { currentScreen = "login" }
+            )
+        }
+
+        "chukaraRate" -> {
+            if (currentUserRole != "ADMIN") {
+                LaunchedEffect(Unit) {
+                    Toast.makeText(
+                        context,
+                        "Only Master Admin can change Chukara Rate",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    currentScreen = "dashboard"
+                }
+            } else {
+                ChukaraRateScreen(
+                    masterUid = currentMasterUid,
+                    onBack = {
+                        currentScreen = "adminDashboard"
+                    }
+                )
+            }
+        }
 
         "printerSetup" -> {
             PrinterSetupScreen(
@@ -1878,6 +2374,9 @@ fun LakshyaApp() {
                                         permission.isAllowed
                                 }
 
+                            ChukaraRateRuntime.employeeRateAllowed =
+                                currentEmployeePermissions["CHUKARA_RATE"] != false
+
                             currentScreen = "dashboard"
 
                             // Real-time permission listener moved to DisposableEffect.
@@ -2000,6 +2499,10 @@ fun LakshyaApp() {
 
                 onGameWiseLimit = {
                     currentScreen = "gameWiseLimit"
+                },
+
+                onChukaraRate = {
+                    currentScreen = "chukaraRate"
                 },
 
                 onResult = {
@@ -2372,60 +2875,74 @@ fun LakshyaApp() {
                 mutableStateOf<String?>(null)
             }
 
-            ExportGameSelectionScreen(
-                exportingGame = exportingGame,
-                onBack = {
-                    if (exportingGame == null) {
-                        currentScreen =
-                            if (currentUserRole == "ADMIN") {
-                                "adminDashboard"
-                            } else {
-                                "dashboard"
-                            }
-                    }
-                },
-                onGameSelected = { selectedGame ->
-                    if (exportingGame == null) {
-                        exportingGame = selectedGame
+            if (
+                currentUserRole == "EMPLOYEE" &&
+                !(currentEmployeePermissions["EXCEL_EXPORT"] ?: true)
+            ) {
+                LaunchedEffect(Unit) {
+                    Toast.makeText(
+                        context,
+                        "EXCEL EXPORT permission is OFF",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    currentScreen = "dashboard"
+                }
+            } else {
+                ExportGameSelectionScreen(
+                    exportingGame = exportingGame,
+                    onBack = {
+                        if (exportingGame == null) {
+                            currentScreen =
+                                if (currentUserRole == "ADMIN") {
+                                    "adminDashboard"
+                                } else {
+                                    "dashboard"
+                                }
+                        }
+                    },
+                    onGameSelected = { selectedGame ->
+                        if (exportingGame == null) {
+                            exportingGame = selectedGame
 
-                        coroutineScope.launch {
-                            // Give Compose time to draw the DOWNLOADING state.
-                            kotlinx.coroutines.delay(250)
+                            coroutineScope.launch {
+                                // Give Compose time to draw the DOWNLOADING state.
+                                kotlinx.coroutines.delay(250)
 
-                            try {
-                                val fileName = exportLimitExcel(
-                                    context = context,
-                                    savedEntries = todayEntries,
-                                    selectedGame = selectedGame
-                                )
+                                try {
+                                    val fileName = exportLimitExcel(
+                                        context = context,
+                                        savedEntries = todayEntries,
+                                        selectedGame = selectedGame
+                                    )
 
-                                Toast.makeText(
-                                    context,
-                                    "$selectedGame Excel Download Complete: $fileName",
-                                    Toast.LENGTH_LONG
-                                ).show()
+                                    Toast.makeText(
+                                        context,
+                                        "$selectedGame Excel Download Complete: $fileName",
+                                        Toast.LENGTH_LONG
+                                    ).show()
 
-                                exportingGame = null
-                                currentScreen =
-                                    if (currentUserRole == "ADMIN") {
-                                        "adminDashboard"
-                                    } else {
-                                        "dashboard"
-                                    }
+                                    exportingGame = null
+                                    currentScreen =
+                                        if (currentUserRole == "ADMIN") {
+                                            "adminDashboard"
+                                        } else {
+                                            "dashboard"
+                                        }
 
-                            } catch (e: Exception) {
-                                exportingGame = null
+                                } catch (e: Exception) {
+                                    exportingGame = null
 
-                                Toast.makeText(
-                                    context,
-                                    "Excel Export Failed: ${e.message}",
-                                    Toast.LENGTH_LONG
-                                ).show()
+                                    Toast.makeText(
+                                        context,
+                                        "Excel Export Failed: ${e.message}",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                }
                             }
                         }
                     }
-                }
-            )
+                )
+            }
         }
 
 
@@ -2595,7 +3112,15 @@ fun LakshyaApp() {
                 permissions = currentEmployeePermissions,
 
                 onEditEntry = { entry ->
-                    if (entry.isDayLocked) {
+                    if (currentUserRole != "ADMIN" &&
+                        !(currentEmployeePermissions["EDIT_ENTRY"] ?: true)
+                    ) {
+                        Toast.makeText(
+                            context,
+                            "EDIT ENTRY permission is OFF",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    } else if (entry.isDayLocked) {
                         Toast.makeText(
                             context,
                             "DAY CLOSED: This entry is permanently locked",
@@ -5135,6 +5660,7 @@ val EMPLOYEE_FEATURE_OPTIONS = listOf(
     EmployeeFeatureOption("JODI_HISTORY", "JODI HISTORY"),
     EmployeeFeatureOption("PANEL_HISTORY", "PANEL HISTORY"),
     EmployeeFeatureOption("CHUKARA", "CHUKARA"),
+    EmployeeFeatureOption("CHUKARA_RATE", "CHUKARA RATE"),
     EmployeeFeatureOption("PROFIT_LOSS", "PROFIT / LOSS"),
     EmployeeFeatureOption("EXCEL_EXPORT", "EXPORT TO EXCEL"),
     EmployeeFeatureOption("PRINT", "PRINT"),
@@ -5629,15 +6155,8 @@ fun calculateHistoricalChukara(
 
                 if (isWin) {
 
-                    val multiplier =
-                        when (
-                            entry.entryType
-                        ) {
-                            "Single" -> 9
-                            "Jodi" -> 80
-                            "Pana" -> 100
-                            else -> 0
-                        }
+                    val chukaraAmount =
+                        calculateConfiguredChukara(entry)
 
                     wins.add(
                         WinningChukara(
@@ -5649,8 +6168,7 @@ fun calculateHistoricalChukara(
                             playedAmount =
                                 entry.amount,
                             chukaraAmount =
-                                entry.amount *
-                                        multiplier,
+                                chukaraAmount,
                             paymentKey =
                                 "OLD|${savedEntry.id}|$game|${entry.entryType}|${entry.number}|$index|$result"
                         )
@@ -7585,6 +8103,196 @@ private fun SuperMasterDetailRow(
 
 
 @Composable
+fun ChukaraRateScreen(
+    masterUid: String,
+    onBack: () -> Unit
+) {
+    val context = LocalContext.current
+
+    var enabled by remember { mutableStateOf(ChukaraRateRuntime.config.enabled) }
+    var singleRate by remember { mutableStateOf(ChukaraRateRuntime.config.singleRate.toString()) }
+    var jodiRate by remember { mutableStateOf(ChukaraRateRuntime.config.jodiRate.toString()) }
+    var panaRate by remember { mutableStateOf(ChukaraRateRuntime.config.panaRate.toString()) }
+    var saving by remember { mutableStateOf(false) }
+
+    DisposableEffect(masterUid) {
+        val registration =
+            ChukaraRateManager.listenRateConfig(
+                masterUid = masterUid,
+                onUpdate = { config ->
+                    enabled = config.enabled
+                    singleRate = config.singleRate.toString()
+                    jodiRate = config.jodiRate.toString()
+                    panaRate = config.panaRate.toString()
+                }
+            )
+
+        onDispose {
+            registration?.remove()
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(18.dp)
+    ) {
+        Text(
+            text = "CHUKARA RATE",
+            fontSize = 25.sp,
+            fontWeight = FontWeight.Black
+        )
+
+        Spacer(Modifier.height(5.dp))
+
+        Text(
+            text = "Master ID se rate control",
+            fontSize = 12.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+
+        Spacer(Modifier.height(18.dp))
+
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        "CHUKARA RATE ON/OFF",
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        "OFF hone par existing calculation rahega.",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+
+                Switch(
+                    checked = enabled,
+                    onCheckedChange = { enabled = it }
+                )
+            }
+        }
+
+        Spacer(Modifier.height(14.dp))
+
+        OutlinedTextField(
+            value = singleRate,
+            onValueChange = {
+                if (it.all(Char::isDigit) && it.length <= 2) singleRate = it
+            },
+            label = { Text("SINGLE RATE") },
+            supportingText = {
+                Text("9 = existing 5.5 / 11 / 16.5 formula | 10 = amount × 10")
+            },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(
+                keyboardType = KeyboardType.Number
+            )
+        )
+
+        Spacer(Modifier.height(12.dp))
+
+        OutlinedTextField(
+            value = jodiRate,
+            onValueChange = {
+                if (it.all(Char::isDigit) && it.length <= 2) jodiRate = it
+            },
+            label = { Text("JODI RATE") },
+            supportingText = {
+                Text("10 = amount × 100 | 9 = amount × 90 | 8 = amount × 80")
+            },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(
+                keyboardType = KeyboardType.Number
+            )
+        )
+
+        Spacer(Modifier.height(12.dp))
+
+        OutlinedTextField(
+            value = panaRate,
+            onValueChange = {
+                if (it.all(Char::isDigit) && it.length <= 2) panaRate = it
+            },
+            label = { Text("PANA RATE") },
+            supportingText = {
+                Text("10 = amount × 100 | 9 = amount × 90 | 8 = amount × 80")
+            },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(
+                keyboardType = KeyboardType.Number
+            )
+        )
+
+        Spacer(Modifier.height(20.dp))
+
+        Button(
+            enabled = !saving,
+            onClick = {
+                val config = ChukaraRateConfig(
+                    enabled = enabled,
+                    singleRate = singleRate.toIntOrNull()?.coerceIn(9, 10) ?: 9,
+                    jodiRate = jodiRate.toIntOrNull()?.coerceAtLeast(8) ?: 8,
+                    panaRate = panaRate.toIntOrNull()?.coerceAtLeast(8) ?: 10
+                )
+
+                saving = true
+
+                ChukaraRateManager.saveRateConfig(
+                    masterUid = masterUid,
+                    config = config,
+                    onSuccess = {
+                        ChukaraRateRuntime.config = config
+                        saving = false
+                        Toast.makeText(
+                            context,
+                            "CHUKARA RATE SAVED",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    },
+                    onError = { message ->
+                        saving = false
+                        Toast.makeText(
+                            context,
+                            message,
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                )
+            },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(54.dp)
+        ) {
+            Text(
+                if (saving) "SAVING..." else "SAVE CHUKARA RATE",
+                fontWeight = FontWeight.Bold
+            )
+        }
+
+        Spacer(Modifier.height(10.dp))
+
+        OutlinedButton(
+            onClick = onBack,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("BACK")
+        }
+    }
+}
+
+
+@Composable
 fun AdminDashboardScreen(
     savedEntries: List<SavedEntry>,
     isSuperMaster: Boolean,
@@ -7597,6 +8305,7 @@ fun AdminDashboardScreen(
     onOldDayBackup: () -> Unit,
     onEmployeePermissions: () -> Unit,
     onGameWiseLimit: () -> Unit,
+    onChukaraRate: () -> Unit,
     onResult: () -> Unit,
     onProfitLoss: () -> Unit,
     onExportExcel: () -> Unit,
@@ -7893,7 +8602,18 @@ fun AdminDashboardScreen(
                 HomeQuickCard("EMPLOYEES", "Profiles & activity", Modifier.weight(1f), onManageEmployees)
                 HomeQuickCard("PERMISSIONS", "Access control", Modifier.weight(1f), onEmployeePermissions)
             }
+
             Spacer(Modifier.height(12.dp))
+
+            HomeQuickCard(
+                "CHUKARA RATE",
+                "Master rate control",
+                Modifier.fillMaxWidth(),
+                onChukaraRate
+            )
+
+            Spacer(Modifier.height(12.dp))
+
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 if (uiConfig.showHistory) {
                     HomeQuickCard(
@@ -8019,6 +8739,11 @@ fun AdminDashboardScreen(
                     HomeMenuRow("Employee Permissions") {
                         showMenu = false
                         onEmployeePermissions()
+                    }
+
+                    HomeMenuRow("CHUKARA RATE") {
+                        showMenu = false
+                        onChukaraRate()
                     }
 
                     MenuSectionTitle("DAY CONTROL")
@@ -11768,7 +12493,7 @@ fun SearchReportsScreen(
 
                             if (savedEntry.status == "ACTIVE") {
 
-                                if (!editLocked) {
+                                if (!editLocked && employeeAllowed("EDIT_ENTRY")) {
                                     Button(
                                         onClick = {
                                             onEditEntry(savedEntry)
@@ -11799,7 +12524,11 @@ fun SearchReportsScreen(
 
                                 // RESULT/AKDA DECLARED = FULL PERMANENT LOCK.
                                 // Result declared hone ke baad CANCEL bhi allowed nahi hai.
-                                if (!hasDeclaredResult && !savedEntry.isDayLocked) {
+                                if (
+                                    employeeAllowed("CANCEL_ENTRY") &&
+                                    !hasDeclaredResult &&
+                                    !savedEntry.isDayLocked
+                                ) {
                                     Button(
                                         onClick = {
                                             entryToCancel = savedEntry
@@ -15402,8 +16131,8 @@ fun calculateEntryChukara(
 ): List<WinningChukara> {
     if (savedEntry.status != "ACTIVE") return emptyList()
 
-    // A chukara can only be paid against a printed receipt.  This applies to
-    // old records too, so an unprinted legacy slip never becomes payable.
+    // CHUKARA ONLY AFTER SUCCESSFUL PRINT.
+    // No print = no Chukara.
     if (!savedEntry.isPrinted) return emptyList()
 
     val wins = mutableListOf<WinningChukara>()
@@ -15517,19 +16246,8 @@ fun calculateEntryChukara(
             }
 
             if (isWin) {
-                val chukaraAmount = when (entry.entryType) {
-                    // SINGLE AKDA ONLY:
-                    // ₹5.5 = ₹50, ₹11 = ₹100, ₹16.5 = ₹150,
-                    // ₹50 = ₹450, ₹55 = ₹500.
-                    // Formula: every ₹5.5 played gives ₹50 Chukara.
-                    "Single" ->
-                        (kotlin.math.floor(entry.actualAmount / 5.5) * 50.0).toInt()
-
-                    // JODI and PANA calculation remains exactly unchanged.
-                    "Jodi" -> entry.amount * 80
-                    "Pana" -> entry.amount * 100
-                    else -> 0
-                }
+                val chukaraAmount =
+                    calculateConfiguredChukara(entry)
                 val key = "${savedEntry.id}|$game|${entry.entryType}|${entry.number}|$index|$result"
                 wins.add(
                     WinningChukara(
