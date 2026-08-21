@@ -466,7 +466,9 @@ private fun calculateConfiguredChukara(entry: NumberAmountEntry): Int {
     val config = ChukaraRateRuntime.config
 
     // OFF = existing Chukara calculation.
-    if (!config.enabled || !ChukaraRateRuntime.employeeRateAllowed) {
+    // Employee permission controls access to the rate setting,
+    // not whether the Employee uses the Master's configured rate.
+    if (!config.enabled) {
         return when (entry.entryType) {
             "Single" -> calculateRate9Single(entry.actualAmount)
             "Jodi" -> entry.amount * 80
@@ -481,7 +483,7 @@ private fun calculateConfiguredChukara(entry: NumberAmountEntry): Int {
                 calculateRate9Single(entry.actualAmount)
             } else {
                 // Single rate 10: any amount × 10.
-                (entry.actualAmount * 10.0).toInt()
+                (entry.actualAmount * config.singleRate.toDouble()).toInt()
             }
         }
 
