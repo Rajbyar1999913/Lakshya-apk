@@ -387,20 +387,73 @@ object ChukaraRateManager {
             return
         }
 
+        val data = mapOf(
+            "enabled" to config.enabled,
+            "singleRate" to config.singleRate,
+            "jodiRate" to config.jodiRate,
+            "panaRate" to config.panaRate,
+            "updatedAt" to com.google.firebase.firestore.FieldValue.serverTimestamp()
+        )
+
         document(masterUid)
             .set(
-                mapOf(
-                    "enabled" to config.enabled,
-                    "singleRate" to config.singleRate,
-                    "jodiRate" to config.jodiRate,
-                    "panaRate" to config.panaRate,
-                    "updatedAt" to System.currentTimeMillis()
-                ),
+                data,
                 com.google.firebase.firestore.SetOptions.merge()
             )
-            .addOnSuccessListener { onSuccess() }
+            .addOnSuccessListener {
+                // Update this device immediately; the snapshot listener will
+                // update every other logged-in device under the same Master UID.
+                ChukaraRateRuntime.config = config
+                onSuccess()
+            }
             .addOnFailureListener {
                 onError(it.message ?: "Unable to save Chukara Rate")
+            }
+    }
+
+    private fun readConfig(
+        snapshot: com.google.firebase.firestore.DocumentSnapshot
+    ): ChukaraRateConfig {
+        return ChukaraRateConfig(
+            enabled = snapshot.getBoolean("enabled") ?: true,
+            singleRate = (snapshot.getLong("singleRate") ?: 9L)
+                .toInt()
+                .coerceIn(9, 10),
+            jodiRate = (snapshot.getLong("jodiRate") ?: 8L)
+                .toInt()
+                .coerceAtLeast(8),
+            panaRate = (snapshot.getLong("panaRate") ?: 10L)
+                .toInt()
+                .coerceAtLeast(8)
+        )
+    }
+
+    fun refreshRateConfig(
+        masterUid: String,
+        onUpdate: (ChukaraRateConfig) -> Unit,
+        onError: (String) -> Unit = {}
+    ) {
+        if (masterUid.isBlank()) {
+            onUpdate(ChukaraRateConfig())
+            return
+        }
+
+        document(masterUid)
+            .get(com.google.firebase.firestore.Source.SERVER)
+            .addOnSuccessListener { snapshot ->
+                if (!snapshot.exists()) {
+                    val config = ChukaraRateConfig()
+                    ChukaraRateRuntime.config = config
+                    onUpdate(config)
+                    return@addOnSuccessListener
+                }
+
+                val config = readConfig(snapshot)
+                ChukaraRateRuntime.config = config
+                onUpdate(config)
+            }
+            .addOnFailureListener {
+                onError(it.message ?: "Unable to refresh Chukara Rate")
             }
     }
 
@@ -414,33 +467,33 @@ object ChukaraRateManager {
             return null
         }
 
-        return document(masterUid)
-            .addSnapshotListener { snapshot, error ->
-                if (error != null) {
-                    onError(error.message ?: "Chukara Rate sync error")
-                    return@addSnapshotListener
-                }
+        val ref = document(masterUid)
 
-                if (snapshot == null || !snapshot.exists()) {
-                    val defaultConfig = ChukaraRateConfig()
-                    ChukaraRateRuntime.config = defaultConfig
-                    onUpdate(defaultConfig)
-                    return@addSnapshotListener
-                }
+        // Force one SERVER read first so a newly installed/second device
+        // cannot remain stuck on its local Firestore cache.
+        refreshRateConfig(
+            masterUid = masterUid,
+            onUpdate = onUpdate,
+            onError = onError
+        )
 
-                val config = ChukaraRateConfig(
-                    enabled = snapshot.getBoolean("enabled") ?: true,
-                    singleRate = (snapshot.getLong("singleRate") ?: 9L)
-                        .toInt().coerceIn(9, 10),
-                    jodiRate = (snapshot.getLong("jodiRate") ?: 8L)
-                        .toInt().coerceAtLeast(8),
-                    panaRate = (snapshot.getLong("panaRate") ?: 10L)
-                        .toInt().coerceAtLeast(8)
-                )
+        return ref.addSnapshotListener { snapshot, error ->
+            if (error != null) {
+                onError(error.message ?: "Chukara Rate sync error")
+                return@addSnapshotListener
+            }
 
+            if (snapshot == null || !snapshot.exists()) {
+                val config = ChukaraRateConfig()
                 ChukaraRateRuntime.config = config
                 onUpdate(config)
+                return@addSnapshotListener
             }
+
+            val config = readConfig(snapshot)
+            ChukaraRateRuntime.config = config
+            onUpdate(config)
+        }
     }
 }
 
@@ -1740,6 +1793,7 @@ fun LakshyaApp() {
                 ChukaraRateManager.listenRateConfig(
                     masterUid = currentMasterUid,
                     onUpdate = { config ->
+                        // Cloud value is the source of truth for every device.
                         ChukaraRateRuntime.config = config
                         ChukaraRateRuntime.employeeRateAllowed =
                             currentUserRole != "EMPLOYEE" ||
