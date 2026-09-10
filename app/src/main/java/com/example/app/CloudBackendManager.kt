@@ -26,7 +26,9 @@ object CloudBackendManager {
                     startDate = d.getLong("startDate") ?: 0L,
                     expiryDate = d.getLong("expiryDate") ?: 0L,
                     employeeLimit = (d.getLong("employeeLimit") ?: 5L).toInt(),
-                    monthlyPrice = (d.getLong("monthlyPrice") ?: 5000L).toInt()))
+                    monthlyPrice = monthlyPlanPriceFor(
+                        (d.getLong("employeeLimit") ?: 5L).toInt()
+                    )))
             }.addOnFailureListener { onError(it.message ?: "Subscription load failed") }
     }
 

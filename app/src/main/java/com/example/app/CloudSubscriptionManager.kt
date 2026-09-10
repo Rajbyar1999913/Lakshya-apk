@@ -10,7 +10,7 @@ data class CloudSubscriptionData(
 
     val employeeLimit: Int = 5,
 
-    val monthlyPrice: Int = 5000,
+    val monthlyPrice: Int = 10000,
 
     val isActive: Boolean = false,
 
@@ -114,11 +114,10 @@ object CloudSubscriptionManager {
                                 ).toInt()
 
 
-                    val monthlyPrice =
-                        (
-                                document.getLong("monthlyPrice")
-                                    ?: 5000L
-                                ).toInt()
+                    // Legacy accounts may still contain the former ₹5,000
+                    // value. Derive the price from the plan limit so every
+                    // 5-employee plan consistently displays ₹10,000.
+                    val monthlyPrice = monthlyPlanPriceFor(employeeLimit)
 
 
                     val isActive =
@@ -229,7 +228,7 @@ object CloudSubscriptionManager {
 
                         employeeLimit = 5,
 
-                        monthlyPrice = 5000,
+                        monthlyPrice = 10000,
 
                         isActive = false,
 

@@ -32,13 +32,19 @@ class SubscriptionManager(
 
         const val DEFAULT_EMPLOYEE_LIMIT = 5
 
-        const val DEFAULT_MONTHLY_PRICE = 5000
+        const val DEFAULT_MONTHLY_PRICE = 10000
     }
 
 
     // GET COMPLETE SUBSCRIPTION DATA
 
     fun getSubscription(): SubscriptionData {
+
+        val employeeLimit =
+            preferences.getInt(
+                KEY_EMPLOYEE_LIMIT,
+                DEFAULT_EMPLOYEE_LIMIT
+            )
 
         return SubscriptionData(
 
@@ -54,17 +60,9 @@ class SubscriptionManager(
                     0L
                 ),
 
-            employeeLimit =
-                preferences.getInt(
-                    KEY_EMPLOYEE_LIMIT,
-                    DEFAULT_EMPLOYEE_LIMIT
-                ),
+            employeeLimit = employeeLimit,
 
-            monthlyPrice =
-                preferences.getInt(
-                    KEY_MONTHLY_PRICE,
-                    DEFAULT_MONTHLY_PRICE
-                )
+            monthlyPrice = monthlyPlanPriceFor(employeeLimit)
         )
     }
 
@@ -214,9 +212,11 @@ class SubscriptionManager(
 
     fun getMonthlyPrice(): Int {
 
-        return preferences.getInt(
-            KEY_MONTHLY_PRICE,
-            DEFAULT_MONTHLY_PRICE
+        return monthlyPlanPriceFor(
+            preferences.getInt(
+                KEY_EMPLOYEE_LIMIT,
+                DEFAULT_EMPLOYEE_LIMIT
+            )
         )
     }
 

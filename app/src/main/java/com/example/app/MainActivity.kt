@@ -8,6 +8,10 @@ import android.os.Bundle
 import android.widget.Toast
 import android.content.ContentValues
 import android.provider.MediaStore
+import android.provider.Settings
+import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.FieldValue
+import com.google.firebase.firestore.SetOptions
 import android.os.Environment
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -47,6 +51,7 @@ import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
@@ -268,6 +273,200 @@ fun BackendBlockedScreen(
 }
 
 // =====================================================
+// IQ200 - SINGLE DEVICE LOGIN LOCK
+// SAME ID = ONLY ONE ACTIVE DEVICE
+// =====================================================
+
+object SingleDeviceSessionManager {
+
+    private val firestore by lazy {
+        FirebaseFirestore.getInstance()
+    }
+
+    private const val SESSION_TIMEOUT_MS = 60_000L
+
+    private fun deviceId(context: android.content.Context): String {
+        return Settings.Secure.getString(
+            context.contentResolver,
+            Settings.Secure.ANDROID_ID
+        ).orEmpty().ifBlank {
+            "UNKNOWN_DEVICE"
+        }
+    }
+
+    private fun sessionDocument(
+        masterUid: String,
+        role: String,
+        userId: String
+    ) = firestore
+        .collection("masters")
+        .document(masterUid)
+        .collection("active_sessions")
+        .document(
+            if (role == "EMPLOYEE") {
+                // Employee sessions use the Firebase Auth UID as the document ID.
+                // This lets Firestore rules identify the employee safely even when
+                // the session document does not exist yet (first login).
+                val authUid = com.google.firebase.auth.FirebaseAuth
+                    .getInstance()
+                    .currentUser
+                    ?.uid
+                    .orEmpty()
+
+                "EMPLOYEE_$authUid"
+            } else {
+                "${role}_${userId.trim().uppercase()}"
+            }
+        )
+
+    fun acquire(
+        context: android.content.Context,
+        masterUid: String,
+        role: String,
+        userId: String,
+        onSuccess: () -> Unit,
+        onBlocked: (String) -> Unit,
+        onError: (String) -> Unit
+    ) {
+        if (masterUid.isBlank() || userId.isBlank()) {
+            onError("Login session information missing.")
+            return
+        }
+
+        val currentDeviceId = deviceId(context)
+        val ref = sessionDocument(masterUid, role, userId)
+
+        // IQ200 FIX: do not throw a custom exception from the Firestore
+        // transaction. Firestore can wrap transaction exceptions, which was
+        // causing a valid ID to fall into the generic login-error path.
+        // Instead, the transaction returns true = acquired, false = blocked.
+        firestore.runTransaction { transaction ->
+            val snapshot = transaction.get(ref)
+            val existingDeviceId = snapshot.getString("deviceId").orEmpty()
+            val lastSeen = snapshot.getLong("lastSeen") ?: 0L
+            val now = System.currentTimeMillis()
+
+            val existingSessionActive =
+                snapshot.exists() &&
+                        snapshot.getBoolean("active") == true &&
+                        existingDeviceId.isNotBlank() &&
+                        existingDeviceId != currentDeviceId &&
+                        (now - lastSeen) < SESSION_TIMEOUT_MS
+
+            if (existingSessionActive) {
+                // Same ID is already active on another device.
+                // Do NOT overwrite that device's session.
+                false
+            } else {
+                val data = hashMapOf<String, Any>(
+                    "deviceId" to currentDeviceId,
+                    "authUid" to (com.google.firebase.auth.FirebaseAuth
+                        .getInstance()
+                        .currentUser
+                        ?.uid
+                        .orEmpty()),
+                    "userId" to userId.trim().uppercase(),
+                    "role" to role,
+                    "masterUid" to masterUid,
+                    "loginAt" to FieldValue.serverTimestamp(),
+                    "lastSeen" to now,
+                    "active" to true
+                )
+
+                transaction.set(ref, data, SetOptions.merge())
+                true
+            }
+        }.addOnSuccessListener { acquired ->
+            if (acquired == true) {
+                onSuccess()
+            } else {
+                onBlocked("This ID is already active on another device.")
+            }
+        }.addOnFailureListener { error ->
+            onError(
+                error.message
+                    ?: "Unable to verify active device session."
+            )
+        }
+    }
+
+    fun heartbeat(
+        context: android.content.Context,
+        masterUid: String,
+        role: String,
+        userId: String
+    ) {
+        if (masterUid.isBlank() || role.isBlank() || userId.isBlank()) return
+
+        val currentDeviceId = deviceId(context)
+        val ref = sessionDocument(masterUid, role, userId)
+
+        // IMPORTANT: heartbeat must NEVER recreate/reactivate a session after
+        // the user has logged out. It may only refresh a session that is
+        // already active and still belongs to this exact device.
+        firestore.runTransaction { transaction ->
+            val snapshot = transaction.get(ref)
+
+            val active = snapshot.getBoolean("active") == true
+            val ownerDeviceId = snapshot.getString("deviceId").orEmpty()
+
+            if (active && ownerDeviceId == currentDeviceId) {
+                transaction.update(
+                    ref,
+                    mapOf(
+                        "lastSeen" to System.currentTimeMillis()
+                    )
+                )
+            }
+
+            null
+        }
+    }
+
+    fun release(
+        context: android.content.Context,
+        masterUid: String,
+        role: String,
+        userId: String,
+        onComplete: () -> Unit = {}
+    ) {
+        if (masterUid.isBlank() || role.isBlank() || userId.isBlank()) {
+            onComplete()
+            return
+        }
+
+        val currentDeviceId = deviceId(context)
+        val ref = sessionDocument(masterUid, role, userId)
+
+        // IMPORTANT: finish the Firestore write BEFORE the app moves to the
+        // login screen. This prevents another device from racing the logout
+        // and temporarily seeing the old active session.
+        firestore.runTransaction { transaction ->
+            val snapshot = transaction.get(ref)
+            val existingDeviceId = snapshot.getString("deviceId").orEmpty()
+
+            if (existingDeviceId == currentDeviceId) {
+                transaction.set(
+                    ref,
+                    mapOf(
+                        "active" to false,
+                        "lastSeen" to 0L,
+                        "releasedAt" to FieldValue.serverTimestamp()
+                    ),
+                    SetOptions.merge()
+                )
+            }
+            null
+        }.addOnCompleteListener {
+            onComplete()
+        }
+    }
+
+    private class ExistingDeviceSessionException :
+        Exception("ACTIVE_SESSION_ON_ANOTHER_DEVICE")
+}
+
+// =====================================================
 // FINAL 14 GAMES
 // =====================================================
 
@@ -365,6 +564,123 @@ object ChukaraRateRuntime {
     var employeeRateAllowed: Boolean = true
 }
 
+data class ChukaraPrintAccessConfig(
+    val withPrint: Boolean = true,
+    val withoutPrint: Boolean = false,
+    val authorizedPrinterId: String = "",
+    val pairingCode: String = ""
+)
+
+object ChukaraPrintAccessRuntime {
+    @Volatile
+    var config: ChukaraPrintAccessConfig = ChukaraPrintAccessConfig()
+
+    @Volatile
+    var configMasterUid: String = ""
+
+    // TRUE only when an Employee is actually allowed to receive
+    // Chukara WITHOUT PRINT. Master/Admin behavior remains unaffected.
+    @Volatile
+    var employeeWithoutPrintAllowed: Boolean = true
+}
+
+object ChukaraPrintAccessManager {
+    private val firestore by lazy {
+        com.google.firebase.firestore.FirebaseFirestore.getInstance()
+    }
+
+    private fun document(masterUid: String) =
+        firestore.collection("masters")
+            .document(masterUid)
+            .collection("settings")
+            .document("chukara_print_access")
+
+    private fun normalize(config: ChukaraPrintAccessConfig): ChukaraPrintAccessConfig =
+        if (config.withoutPrint) {
+            config.copy(withPrint = false, withoutPrint = true)
+        } else {
+            config.copy(withPrint = true, withoutPrint = false)
+        }
+
+    fun saveConfig(
+        masterUid: String,
+        config: ChukaraPrintAccessConfig,
+        onSuccess: () -> Unit = {},
+        onError: (String) -> Unit = {}
+    ) {
+        if (masterUid.isBlank()) {
+            onError("Master UID missing")
+            return
+        }
+        val safe = normalize(config)
+        val data = mapOf(
+            "withPrint" to safe.withPrint,
+            "withoutPrint" to safe.withoutPrint,
+            "authorizedPrinterId" to safe.authorizedPrinterId.trim().uppercase(),
+            "pairingCode" to safe.pairingCode.trim(),
+            "updatedAt" to com.google.firebase.firestore.FieldValue.serverTimestamp()
+        )
+        document(masterUid)
+            .set(data, com.google.firebase.firestore.SetOptions.merge())
+            .addOnSuccessListener {
+                ChukaraPrintAccessRuntime.config = safe
+                onSuccess()
+            }
+            .addOnFailureListener {
+                onError(it.message ?: "Unable to save Chukara print control")
+            }
+    }
+
+    private fun read(snapshot: com.google.firebase.firestore.DocumentSnapshot) =
+        normalize(
+            ChukaraPrintAccessConfig(
+                withPrint = snapshot.getBoolean("withPrint") ?: true,
+                withoutPrint = snapshot.getBoolean("withoutPrint") ?: false,
+                authorizedPrinterId = snapshot.getString("authorizedPrinterId").orEmpty(),
+                pairingCode = snapshot.getString("pairingCode").orEmpty()
+            )
+        )
+
+    fun listenConfig(
+        masterUid: String,
+        onUpdate: (ChukaraPrintAccessConfig) -> Unit,
+        onError: (String) -> Unit = {}
+    ): com.google.firebase.firestore.ListenerRegistration? {
+        if (masterUid.isBlank()) {
+            val config = ChukaraPrintAccessConfig()
+            ChukaraPrintAccessRuntime.config = config
+            onUpdate(config)
+            return null
+        }
+
+        val ref = document(masterUid)
+
+        ref.get(com.google.firebase.firestore.Source.SERVER)
+            .addOnSuccessListener { snapshot ->
+                val config = if (snapshot.exists()) read(snapshot) else ChukaraPrintAccessConfig()
+                ChukaraPrintAccessRuntime.config = config
+                onUpdate(config)
+            }
+            .addOnFailureListener {
+                onError(it.message ?: "Unable to load Chukara print control")
+            }
+
+        return ref.addSnapshotListener { snapshot, error ->
+            if (error != null) {
+                onError(error.message ?: "Chukara print control sync error")
+                return@addSnapshotListener
+            }
+            val config = if (snapshot == null || !snapshot.exists()) {
+                ChukaraPrintAccessConfig()
+            } else {
+                read(snapshot)
+            }
+            ChukaraPrintAccessRuntime.config = config
+            onUpdate(config)
+        }
+    }
+}
+
 object ChukaraRateManager {
     private val firestore by lazy {
         com.google.firebase.firestore.FirebaseFirestore.getInstance()
@@ -401,9 +717,15 @@ object ChukaraRateManager {
                 com.google.firebase.firestore.SetOptions.merge()
             )
             .addOnSuccessListener {
-                // Update this device immediately; the snapshot listener will
-                // update every other logged-in device under the same Master UID.
                 ChukaraRateRuntime.config = config
+
+                // Mirror only Chukara state into employee_lookup so a
+                // separately logged-in Employee device receives the change.
+                ChukaraEmployeeRealtimeSync.syncRateToEmployees(
+                    masterUid = masterUid,
+                    config = config
+                )
+
                 onSuccess()
             }
             .addOnFailureListener {
@@ -497,6 +819,164 @@ object ChukaraRateManager {
     }
 }
 
+/**
+ * Chukara realtime bridge for separately logged-in Employee devices.
+ *
+ * Existing Master settings and all other application sync paths remain
+ * unchanged. Only Chukara state is mirrored into the Employee's own
+ * employee_lookup/{employeeUid} document.
+ */
+object ChukaraEmployeeRealtimeSync {
+    private val firestore by lazy {
+        com.google.firebase.firestore.FirebaseFirestore.getInstance()
+    }
+
+    fun syncRateToEmployees(
+        masterUid: String,
+        config: ChukaraRateConfig
+    ) {
+        if (masterUid.isBlank()) return
+
+        firestore.collection("masters")
+            .document(masterUid)
+            .collection("employees")
+            .get()
+            .addOnSuccessListener { snapshot ->
+                snapshot.documents.forEach { employee ->
+                    val employeeUid = employee.id
+                    if (employeeUid.isBlank()) return@forEach
+
+                    firestore.collection("employee_lookup")
+                        .document(employeeUid)
+                        .set(
+                            mapOf(
+                                "chukaraRateEnabled" to config.enabled,
+                                "chukaraSingleRate" to config.singleRate,
+                                "chukaraJodiRate" to config.jodiRate,
+                                "chukaraPanaRate" to config.panaRate,
+                                "chukaraRateUpdatedAt" to com.google.firebase.firestore.FieldValue.serverTimestamp()
+                            ),
+                            com.google.firebase.firestore.SetOptions.merge()
+                        )
+                }
+            }
+    }
+
+    fun syncMasterPrintToEmployees(
+        masterUid: String,
+        config: ChukaraPrintAccessConfig
+    ) {
+        if (masterUid.isBlank()) return
+
+        firestore.collection("masters")
+            .document(masterUid)
+            .collection("employees")
+            .get()
+            .addOnSuccessListener { snapshot ->
+                snapshot.documents.forEach { employee ->
+                    val employeeUid = employee.id
+                    if (employeeUid.isBlank()) return@forEach
+
+                    firestore.collection("employee_lookup")
+                        .document(employeeUid)
+                        .set(
+                            mapOf(
+                                "chukaraMasterWithPrint" to config.withPrint,
+                                "chukaraMasterWithoutPrint" to config.withoutPrint,
+                                "chukaraMasterPrinterId" to config.authorizedPrinterId,
+                                "chukaraMasterPairingCode" to config.pairingCode,
+                                "chukaraPrintUpdatedAt" to com.google.firebase.firestore.FieldValue.serverTimestamp()
+                            ),
+                            com.google.firebase.firestore.SetOptions.merge()
+                        )
+                }
+            }
+    }
+
+    fun syncEmployeePrint(
+        employeeUid: String,
+        config: EmployeeChukaraPrintAccessConfig
+    ) {
+        if (employeeUid.isBlank()) return
+
+        firestore.collection("employee_lookup")
+            .document(employeeUid)
+            .set(
+                mapOf(
+                    "chukaraEmployeeWithPrint" to config.withPrint,
+                    "chukaraEmployeeWithoutPrint" to config.withoutPrint,
+                    "chukaraEmployeePrinterId" to config.authorizedPrinterId,
+                    "chukaraEmployeePairingCode" to config.pairingCode,
+                    "chukaraPrintUpdatedAt" to com.google.firebase.firestore.FieldValue.serverTimestamp()
+                ),
+                com.google.firebase.firestore.SetOptions.merge()
+            )
+    }
+
+    fun syncNewEmployee(
+        masterUid: String,
+        employeeUid: String
+    ) {
+        if (masterUid.isBlank() || employeeUid.isBlank()) return
+
+        firestore.collection("masters")
+            .document(masterUid)
+            .collection("settings")
+            .document("chukara_rate")
+            .get(com.google.firebase.firestore.Source.SERVER)
+            .addOnSuccessListener { rateSnapshot ->
+
+                firestore.collection("masters")
+                    .document(masterUid)
+                    .collection("settings")
+                    .document("chukara_print_access")
+                    .get(com.google.firebase.firestore.Source.SERVER)
+                    .addOnSuccessListener { printSnapshot ->
+
+                        val rate = ChukaraRateConfig(
+                            enabled = rateSnapshot.getBoolean("enabled") ?: true,
+                            singleRate =
+                                (rateSnapshot.getLong("singleRate") ?: 9L)
+                                    .toInt().coerceIn(9, 10),
+                            jodiRate =
+                                (rateSnapshot.getLong("jodiRate") ?: 8L)
+                                    .toInt().coerceAtLeast(8),
+                            panaRate =
+                                (rateSnapshot.getLong("panaRate") ?: 10L)
+                                    .toInt().coerceAtLeast(8)
+                        )
+
+                        val print = ChukaraPrintAccessConfig(
+                            withPrint = printSnapshot.getBoolean("withPrint") ?: true,
+                            withoutPrint = printSnapshot.getBoolean("withoutPrint") ?: false,
+                            authorizedPrinterId =
+                                printSnapshot.getString("authorizedPrinterId").orEmpty(),
+                            pairingCode =
+                                printSnapshot.getString("pairingCode").orEmpty()
+                        )
+
+                        firestore.collection("employee_lookup")
+                            .document(employeeUid)
+                            .set(
+                                mapOf(
+                                    "chukaraRateEnabled" to rate.enabled,
+                                    "chukaraSingleRate" to rate.singleRate,
+                                    "chukaraJodiRate" to rate.jodiRate,
+                                    "chukaraPanaRate" to rate.panaRate,
+                                    "chukaraMasterWithPrint" to print.withPrint,
+                                    "chukaraMasterWithoutPrint" to print.withoutPrint,
+                                    "chukaraMasterPrinterId" to print.authorizedPrinterId,
+                                    "chukaraMasterPairingCode" to print.pairingCode,
+                                    "chukaraRateUpdatedAt" to com.google.firebase.firestore.FieldValue.serverTimestamp(),
+                                    "chukaraPrintUpdatedAt" to com.google.firebase.firestore.FieldValue.serverTimestamp()
+                                ),
+                                com.google.firebase.firestore.SetOptions.merge()
+                            )
+                    }
+            }
+    }
+}
+
 private fun calculateRate9Single(actualAmount: Double): Int {
     // RATE 9 — EXACT MASTER FORMULA:
     // If amount is a multiple of 5.5, use amount / 11 * 100.
@@ -515,7 +995,17 @@ private fun calculateRate9Single(actualAmount: Double): Int {
     }
 }
 
-private fun calculateConfiguredChukara(entry: NumberAmountEntry): Int {
+private fun calculateConfiguredChukara(
+    entry: NumberAmountEntry,
+    isPrinted: Boolean = false
+): Int {
+    // IMPORTANT:
+    // Employee WITH PRINT receives Chukara only after the receipt is actually
+    // printed. WITHOUT PRINT continues to work immediately as before.
+    if (!ChukaraPrintAccessRuntime.employeeWithoutPrintAllowed && !isPrinted) {
+        return 0
+    }
+
     val config = ChukaraRateRuntime.config
 
     // OFF = existing Chukara calculation.
@@ -555,6 +1045,232 @@ private fun calculateConfiguredChukara(entry: NumberAmountEntry): Int {
 
 const val LAKSHYA_SUPER_MASTER_UID = "dJQ1iVUP10R8TDhdUNwOx1iq1Xk2"
 
+data class EmployeeChukaraPrintAccessConfig(
+    val employeeUid: String = "",
+    val employeeUserId: String = "",
+    val employeeName: String = "",
+    val withPrint: Boolean = true,
+    val withoutPrint: Boolean = false,
+    val authorizedPrinterId: String = "",
+    val pairingCode: String = ""
+)
+
+object EmployeeChukaraPrintAccessRuntime {
+    @Volatile
+    var config: EmployeeChukaraPrintAccessConfig = EmployeeChukaraPrintAccessConfig()
+}
+
+object EmployeeChukaraPrintAccessManager {
+    private val firestore by lazy {
+        com.google.firebase.firestore.FirebaseFirestore.getInstance()
+    }
+
+    private fun document(masterUid: String, employeeUid: String) =
+        firestore.collection("masters")
+            .document(masterUid)
+            .collection("employee_printer_controls")
+            .document(employeeUid)
+
+    private fun normalize(config: EmployeeChukaraPrintAccessConfig): EmployeeChukaraPrintAccessConfig {
+        return if (config.withoutPrint) {
+            config.copy(withPrint = false, withoutPrint = true)
+        } else {
+            config.copy(withPrint = true, withoutPrint = false)
+        }
+    }
+
+    fun saveConfig(
+        masterUid: String,
+        employeeUid: String,
+        employeeUserId: String,
+        employeeName: String,
+        withPrint: Boolean,
+        withoutPrint: Boolean,
+        authorizedPrinterId: String,
+        pairingCode: String,
+        onSuccess: () -> Unit = {},
+        onError: (String) -> Unit = {}
+    ) {
+        if (masterUid.isBlank() || employeeUid.isBlank()) {
+            onError("Employee/Master UID missing")
+            return
+        }
+
+        val safe = normalize(
+            EmployeeChukaraPrintAccessConfig(
+                employeeUid = employeeUid,
+                employeeUserId = employeeUserId.trim().uppercase(),
+                employeeName = employeeName.trim(),
+                withPrint = withPrint,
+                withoutPrint = withoutPrint,
+                authorizedPrinterId = authorizedPrinterId.trim().uppercase(),
+                pairingCode = pairingCode.trim()
+            )
+        )
+
+        val data = hashMapOf<String, Any>(
+            "employeeUid" to employeeUid,
+            "employeeUserId" to safe.employeeUserId,
+            "employeeName" to safe.employeeName,
+            "withPrint" to safe.withPrint,
+            "withoutPrint" to safe.withoutPrint,
+            "authorizedPrinterId" to safe.authorizedPrinterId,
+            "pairingCode" to safe.pairingCode,
+            "updatedAt" to com.google.firebase.firestore.FieldValue.serverTimestamp()
+        )
+
+        document(masterUid, employeeUid)
+            .set(data, com.google.firebase.firestore.SetOptions.merge())
+            .addOnSuccessListener {
+                ChukaraEmployeeRealtimeSync.syncEmployeePrint(
+                    employeeUid = employeeUid,
+                    config = safe
+                )
+                onSuccess()
+            }
+            .addOnFailureListener {
+                onError(it.message ?: "Employee Chukara print control save failed")
+            }
+    }
+
+    fun listenConfig(
+        masterUid: String,
+        employeeUid: String,
+        fallback: EmployeeChukaraPrintAccessConfig = EmployeeChukaraPrintAccessConfig(
+            employeeUid = employeeUid
+        ),
+        onUpdate: (EmployeeChukaraPrintAccessConfig) -> Unit,
+        onError: (String) -> Unit = {}
+    ): com.google.firebase.firestore.ListenerRegistration? {
+        if (masterUid.isBlank() || employeeUid.isBlank()) {
+            val config = fallback.copy(employeeUid = employeeUid)
+            EmployeeChukaraPrintAccessRuntime.config = config
+            onUpdate(config)
+            return null
+        }
+
+        val ref = document(masterUid, employeeUid)
+
+        ref.get(com.google.firebase.firestore.Source.SERVER)
+            .addOnSuccessListener { snapshot ->
+                val config =
+                    if (snapshot.exists()) {
+                        normalize(
+                            EmployeeChukaraPrintAccessConfig(
+                                employeeUid = employeeUid,
+                                employeeUserId = snapshot.getString("employeeUserId").orEmpty(),
+                                employeeName = snapshot.getString("employeeName").orEmpty(),
+                                withPrint = snapshot.getBoolean("withPrint") ?: fallback.withPrint,
+                                withoutPrint = snapshot.getBoolean("withoutPrint") ?: fallback.withoutPrint,
+                                authorizedPrinterId = snapshot.getString("authorizedPrinterId").orEmpty(),
+                                pairingCode = snapshot.getString("pairingCode").orEmpty()
+                            )
+                        )
+                    } else {
+                        fallback.copy(employeeUid = employeeUid)
+                    }
+                EmployeeChukaraPrintAccessRuntime.config = config
+                onUpdate(config)
+            }
+            .addOnFailureListener {
+                onError(it.message ?: "Unable to load Employee Chukara print control")
+            }
+
+        return ref.addSnapshotListener { snapshot, error ->
+            if (error != null) {
+                onError(error.message ?: "Employee Chukara print control sync error")
+                return@addSnapshotListener
+            }
+
+            val config =
+                if (snapshot == null || !snapshot.exists()) {
+                    fallback.copy(employeeUid = employeeUid)
+                } else {
+                    normalize(
+                        EmployeeChukaraPrintAccessConfig(
+                            employeeUid = employeeUid,
+                            employeeUserId = snapshot.getString("employeeUserId").orEmpty(),
+                            employeeName = snapshot.getString("employeeName").orEmpty(),
+                            withPrint = snapshot.getBoolean("withPrint") ?: fallback.withPrint,
+                            withoutPrint = snapshot.getBoolean("withoutPrint") ?: fallback.withoutPrint,
+                            authorizedPrinterId = snapshot.getString("authorizedPrinterId").orEmpty(),
+                            pairingCode = snapshot.getString("pairingCode").orEmpty()
+                        )
+                    )
+                }
+
+            EmployeeChukaraPrintAccessRuntime.config = config
+            onUpdate(config)
+        }
+    }
+
+    fun getConfig(
+        masterUid: String,
+        employeeUid: String,
+        fallback: EmployeeChukaraPrintAccessConfig,
+        onSuccess: (EmployeeChukaraPrintAccessConfig) -> Unit,
+        onError: (String) -> Unit = {}
+    ) {
+        document(masterUid, employeeUid)
+            .get(com.google.firebase.firestore.Source.SERVER)
+            .addOnSuccessListener { snapshot ->
+                val config =
+                    if (snapshot.exists()) {
+                        normalize(
+                            EmployeeChukaraPrintAccessConfig(
+                                employeeUid = employeeUid,
+                                employeeUserId = snapshot.getString("employeeUserId").orEmpty(),
+                                employeeName = snapshot.getString("employeeName").orEmpty(),
+                                withPrint = snapshot.getBoolean("withPrint") ?: fallback.withPrint,
+                                withoutPrint = snapshot.getBoolean("withoutPrint") ?: fallback.withoutPrint,
+                                authorizedPrinterId = snapshot.getString("authorizedPrinterId").orEmpty(),
+                                pairingCode = snapshot.getString("pairingCode").orEmpty()
+                            )
+                        )
+                    } else {
+                        fallback.copy(employeeUid = employeeUid)
+                    }
+                onSuccess(config)
+            }
+            .addOnFailureListener {
+                onError(it.message ?: "Unable to load Employee Chukara print control")
+            }
+    }
+
+    fun getConfigs(
+        masterUid: String,
+        onSuccess: (List<EmployeeChukaraPrintAccessConfig>) -> Unit,
+        onError: (String) -> Unit = {}
+    ) {
+        if (masterUid.isBlank()) {
+            onSuccess(emptyList())
+            return
+        }
+
+        firestore.collection("masters")
+            .document(masterUid)
+            .collection("employee_printer_controls")
+            .get()
+            .addOnSuccessListener { snapshot ->
+                val rows = snapshot.documents.map { doc ->
+                    EmployeeChukaraPrintAccessConfig(
+                        employeeUid = doc.id,
+                        employeeUserId = doc.getString("employeeUserId").orEmpty(),
+                        employeeName = doc.getString("employeeName").orEmpty(),
+                        withPrint = doc.getBoolean("withPrint") ?: true,
+                        withoutPrint = doc.getBoolean("withoutPrint") ?: false,
+                        authorizedPrinterId = doc.getString("authorizedPrinterId").orEmpty(),
+                        pairingCode = doc.getString("pairingCode").orEmpty()
+                    )
+                }.map(::normalize)
+                onSuccess(rows)
+            }
+            .addOnFailureListener {
+                onError(it.message ?: "Unable to load Employee Chukara print controls")
+            }
+    }
+}
+
 data class SuperMasterCustomer(
     val masterUid: String = "",
     val businessName: String = "",
@@ -564,9 +1280,15 @@ data class SuperMasterCustomer(
     val accountStatus: String = "",
     val masterAccessActive: Boolean = false,
     val selectedEmployeeLimit: Int = 5,
-    val selectedMonthlyPrice: Int = 5000,
+    val selectedMonthlyPrice: Int = 10000,
     val createdAt: Long = 0L,
-    val subscription: CloudSubscriptionData? = null
+    val subscription: CloudSubscriptionData? = null,
+    val chukaraWithPrint: Boolean = true,
+    val chukaraWithoutPrint: Boolean = false,
+    val authorizedPrinterId: String = "",
+    val printerPairingCode: String = "",
+    val employeeWithPrintCount: Int = 0,
+    val employeeWithoutPrintCount: Int = 0
 )
 
 object SuperMasterCloudManager {
@@ -639,14 +1361,7 @@ object SuperMasterCloudManager {
                                         ?: 5L
                                     ).toInt()
 
-                        val summaryPrice =
-                            (
-                                    document.getLong("subscriptionMonthlyPrice")
-                                        ?: document.getLong(
-                                            "selectedMonthlyPrice"
-                                        )
-                                        ?: 5000L
-                                    ).toInt()
+                        val summaryPrice = monthlyPlanPriceFor(summaryLimit)
 
                         val summarySubscription =
                             CloudSubscriptionData(
@@ -694,18 +1409,27 @@ object SuperMasterCloudManager {
                                             "selectedEmployeeLimit"
                                         ) ?: summaryLimit.toLong()
                                         ).toInt(),
-                            selectedMonthlyPrice =
+                            selectedMonthlyPrice = monthlyPlanPriceFor(
                                 (
                                         document.getLong(
-                                            "selectedMonthlyPrice"
-                                        ) ?: summaryPrice.toLong()
-                                        ).toInt(),
+                                            "selectedEmployeeLimit"
+                                        ) ?: summaryLimit.toLong()
+                                        ).toInt()
+                            ),
                             createdAt =
                                 document.getLong(
                                     "createdAt"
                                 ) ?: 0L,
                             subscription =
-                                summarySubscription
+                                summarySubscription,
+                            chukaraWithPrint =
+                                document.getBoolean("chukaraWithPrint") ?: true,
+                            chukaraWithoutPrint =
+                                document.getBoolean("chukaraWithoutPrint") ?: false,
+                            authorizedPrinterId =
+                                document.getString("authorizedPrinterId").orEmpty(),
+                            printerPairingCode =
+                                document.getString("printerPairingCode").orEmpty()
                         )
                     }
 
@@ -834,7 +1558,7 @@ object SuperMasterCloudManager {
         }
 
         val safeLimit = employeeLimit.coerceIn(5, 10)
-        val monthlyPrice = safeLimit * 1000
+        val monthlyPrice = safeLimit * 2000
         val startDate = System.currentTimeMillis()
 
         val calendar = java.util.Calendar.getInstance().apply {
@@ -885,7 +1609,11 @@ object SuperMasterCloudManager {
             "lastPaymentStatus" to "NO_PAYMENT",
             "deactivatedAt" to 0L,
             "deactivatedByUid" to "",
-            "lastDeactivationType" to ""
+            "lastDeactivationType" to "",
+            "chukaraWithPrint" to true,
+            "chukaraWithoutPrint" to false,
+            "authorizedPrinterId" to "",
+            "printerPairingCode" to ""
         )
 
         val masterRef =
@@ -913,6 +1641,89 @@ object SuperMasterCloudManager {
             }
     }
 
+
+    fun saveChukaraPrintControl(
+        masterUid: String,
+        withoutPrint: Boolean,
+        authorizedPrinterId: String,
+        pairingCode: String,
+        onSuccess: () -> Unit = {},
+        onError: (String) -> Unit = {}
+    ) {
+        val authUid =
+            com.google.firebase.auth.FirebaseAuth.getInstance().currentUser?.uid.orEmpty()
+
+        if (authUid != LAKSHYA_SUPER_MASTER_UID) {
+            onError("Super Master access denied")
+            return
+        }
+        if (masterUid.isBlank()) {
+            onError("Master UID missing")
+            return
+        }
+
+        val safeWithoutPrint = withoutPrint
+        val safeWithPrint = !safeWithoutPrint
+        val safePrinter = authorizedPrinterId.trim().uppercase()
+        val safeCode = pairingCode.trim()
+        val now = System.currentTimeMillis()
+
+        val settingsData = hashMapOf<String, Any>(
+            "withPrint" to safeWithPrint,
+            "withoutPrint" to safeWithoutPrint,
+            "authorizedPrinterId" to safePrinter,
+            "pairingCode" to safeCode,
+            "updatedAt" to now
+        )
+
+        val masterData = hashMapOf<String, Any>(
+            "chukaraWithPrint" to safeWithPrint,
+            "chukaraWithoutPrint" to safeWithoutPrint,
+            "authorizedPrinterId" to safePrinter,
+            "printerPairingCode" to safeCode,
+            "updatedAt" to now
+        )
+
+        val masterRef = firestore.collection("masters").document(masterUid)
+
+        firestore.runBatch { batch ->
+            batch.set(
+                masterRef.collection("settings").document("chukara_print_access"),
+                settingsData,
+                com.google.firebase.firestore.SetOptions.merge()
+            )
+            batch.set(
+                masterRef,
+                masterData,
+                com.google.firebase.firestore.SetOptions.merge()
+            )
+        }.addOnSuccessListener {
+            ChukaraEmployeeRealtimeSync.syncMasterPrintToEmployees(
+                masterUid = masterUid,
+                config = ChukaraPrintAccessConfig(
+                    withPrint = safeWithPrint,
+                    withoutPrint = safeWithoutPrint,
+                    authorizedPrinterId = safePrinter,
+                    pairingCode = safeCode
+                )
+            )
+            onSuccess()
+        }.addOnFailureListener {
+            onError(it.message ?: "Chukara print control save failed")
+        }
+    }
+
+    fun getEmployeePrintControls(
+        masterUid: String,
+        onSuccess: (List<EmployeeChukaraPrintAccessConfig>) -> Unit,
+        onError: (String) -> Unit = {}
+    ) {
+        EmployeeChukaraPrintAccessManager.getConfigs(
+            masterUid = masterUid,
+            onSuccess = onSuccess,
+            onError = onError
+        )
+    }
 
     fun syncSubscriptionSummary(
         masterUid: String,
@@ -987,17 +1798,134 @@ object CloudResultManager {
             .document("${dateKey}_${game}")
             .set(data)
             .addOnSuccessListener {
+                // The Firestore results document itself is the realtime source.
+                // Do not block the successful save on the separate live bridge.
+                onSuccess()
+
+                // Keep the existing live bridge call as a non-blocking compatibility
+                // mirror. Its failure must never stop realtime result sync.
                 CloudAccountSyncManager.saveLiveResult(
                     masterUid = masterUid,
                     game = game,
                     result = result,
                     savedTime = savedTime,
-                    onSuccess = onSuccess,
-                    onError = onError
+                    onSuccess = {},
+                    onError = {}
                 )
             }
             .addOnFailureListener { error ->
                 onError(error.message ?: "Result cloud sync failed")
+            }
+    }
+
+    /**
+     * REAL-TIME RESULT SYNC
+     * Uses the same Master Firestore result collection that saveResult() writes.
+     * This is intentionally independent of the separate live-result bridge so
+     * an Employee device receives the exact same Firestore change immediately.
+     */
+    fun listenResults(
+        masterUid: String,
+        onUpdate: (Map<String, String>, Map<String, Long>) -> Unit,
+        onError: (String) -> Unit = {}
+    ): com.google.firebase.firestore.ListenerRegistration? {
+        if (masterUid.isBlank()) {
+            onUpdate(emptyMap(), emptyMap())
+            return null
+        }
+
+        val firestore = com.google.firebase.firestore.FirebaseFirestore.getInstance()
+        return firestore
+            .collection("masters")
+            .document(masterUid)
+            .collection("results")
+            .addSnapshotListener { snapshot, error ->
+                if (error != null) {
+                    onError(error.message ?: "Result realtime sync failed")
+                    return@addSnapshotListener
+                }
+
+                val docs = snapshot?.documents.orEmpty()
+
+                // Only the active business-day result is treated as LIVE.
+                // Permanent result history remains untouched.
+                val contextPrefs =
+                    try {
+                        val app =
+                            com.google.firebase.FirebaseApp.getInstance().applicationContext
+                        app.getSharedPreferences(
+                            "lakshya_day_archive_$masterUid",
+                            android.content.Context.MODE_PRIVATE
+                        )
+                    } catch (_: Exception) {
+                        null
+                    }
+
+                val storedStart =
+                    contextPrefs?.getLong("CURRENT_DAY_START", 0L) ?: 0L
+
+                val businessStart = if (storedStart > 0L) {
+                    storedStart
+                } else {
+                    val cal = java.util.Calendar.getInstance()
+                    cal.set(java.util.Calendar.HOUR_OF_DAY, 0)
+                    cal.set(java.util.Calendar.MINUTE, 0)
+                    cal.set(java.util.Calendar.SECOND, 0)
+                    cal.set(java.util.Calendar.MILLISECOND, 0)
+                    cal.timeInMillis
+                }
+
+                val latestByGame =
+                    docs.mapNotNull { document ->
+                        val game =
+                            document.getString("game")
+                                .orEmpty()
+                                .trim()
+                                .uppercase()
+                        val result =
+                            document.getString("result")
+                                .orEmpty()
+                                .trim()
+                        val savedTime =
+                            document.getLong("savedTime") ?: 0L
+
+                        val dateKey =
+                            document.getString("dateKey")
+                                .orEmpty()
+                                .trim()
+
+                        val todayKey =
+                            java.text.SimpleDateFormat(
+                                "yyyy-MM-dd",
+                                java.util.Locale.getDefault()
+                            ).format(java.util.Date())
+
+                        // LIVE RESULT must come only from today's cloud result
+                        // document. Never repopulate an Employee screen with an
+                        // older historical result after the current result is
+                        // deleted. This is especially important for MO/MANIPUR
+                        // and KO/KALYAN.
+                        if (
+                            game.isBlank() ||
+                            result.isBlank() ||
+                            savedTime < businessStart ||
+                            dateKey != todayKey
+                        ) {
+                            null
+                        } else {
+                            Triple(game, result, savedTime)
+                        }
+                    }
+                        .groupBy { it.first }
+                        .mapNotNull { (game, rows) ->
+                            rows.maxByOrNull { it.third }?.let { game to it }
+                        }
+                        .toMap()
+
+                val liveResults = latestByGame.mapValues { it.value.second }
+                val resultTimes = latestByGame.mapValues { it.value.third }
+
+                onUpdate(liveResults, resultTimes)
             }
     }
 
@@ -1013,7 +1941,17 @@ object CloudResultManager {
         firestore.collection("masters").document(masterUid)
             .collection("results").document("${dateKey}_${game}").delete()
             .addOnSuccessListener {
-                CloudAccountSyncManager.deleteLiveResult(masterUid, game, onSuccess, onError)
+                // Deleting the permanent result document immediately triggers
+                // listenResults() on every connected Employee/Master device.
+                onSuccess()
+
+                // Keep the existing bridge deletion as a compatibility mirror.
+                CloudAccountSyncManager.deleteLiveResult(
+                    masterUid,
+                    game,
+                    onSuccess = {},
+                    onError = {}
+                )
             }
             .addOnFailureListener { onError(it.message ?: "Result delete failed") }
     }
@@ -1204,9 +2142,10 @@ object MasterAccessManager {
                         employeeLimit =
                             (subscriptionDoc.getLong("employeeLimit")
                                 ?: 5L).toInt(),
-                        monthlyPrice =
-                            (subscriptionDoc.getLong("monthlyPrice")
-                                ?: 5000L).toInt(),
+                        monthlyPrice = monthlyPlanPriceFor(
+                            (subscriptionDoc.getLong("employeeLimit")
+                                ?: 5L).toInt()
+                        ),
                         isActive =
                             subscriptionDoc.getBoolean("isActive") == true,
                         updatedAt =
@@ -1284,8 +2223,9 @@ object CloudPaymentManager {
 // =====================================================
 // 2048 DECOY / HIDDEN LAKSHYA UNLOCK
 // =====================================================
-// Change this one value if you want a different hidden password.
-private const val LAKSHYA_HIDDEN_PASSWORD = "Lakshya2048"
+// Each installation chooses its own hidden 2048 unlock password.
+private const val IQ200_HIDDEN_PASSWORD_PREFS = "iq200_hidden_unlock_password"
+private const val IQ200_HIDDEN_PASSWORD_KEY = "password"
 
 private fun new2048Board(): List<Int> {
     val board = MutableList(16) { 0 }
@@ -1369,8 +2309,18 @@ fun Game2048Screen(
     var board by remember { mutableStateOf(new2048Board()) }
     var score by remember { mutableIntStateOf(0) }
     var titleTapCount by remember { mutableIntStateOf(0) }
+    val context = LocalContext.current
+    val hiddenPasswordPrefs = remember {
+        context.getSharedPreferences(
+            IQ200_HIDDEN_PASSWORD_PREFS,
+            android.content.Context.MODE_PRIVATE
+        )
+    }
+
     var showPasswordDialog by remember { mutableStateOf(false) }
+    var showSetPasswordDialog by remember { mutableStateOf(false) }
     var password by remember { mutableStateOf("") }
+    var confirmPassword by remember { mutableStateOf("") }
     var passwordError by remember { mutableStateOf(false) }
     var gameOver by remember { mutableStateOf(false) }
 
@@ -1413,8 +2363,20 @@ fun Game2048Screen(
                     if (titleTapCount >= 7) {
                         titleTapCount = 0
                         password = ""
+                        confirmPassword = ""
                         passwordError = false
-                        showPasswordDialog = true
+
+                        val savedPassword = hiddenPasswordPrefs
+                            .getString(IQ200_HIDDEN_PASSWORD_KEY, "")
+                            .orEmpty()
+
+                        if (savedPassword.isBlank()) {
+                            // First time on this installation: let the owner
+                            // choose their own hidden password.
+                            showSetPasswordDialog = true
+                        } else {
+                            showPasswordDialog = true
+                        }
                     }
                 }
             )
@@ -1497,6 +2459,101 @@ fun Game2048Screen(
         }
     }
 
+    // First-time setup: every installation can choose its own password.
+    if (showSetPasswordDialog) {
+        AlertDialog(
+            onDismissRequest = {
+                showSetPasswordDialog = false
+                password = ""
+                confirmPassword = ""
+                passwordError = false
+            },
+            title = { Text("Set Your Password") },
+            text = {
+                Column {
+                    Text(
+                        "Create a private password for this device.",
+                        fontSize = 13.sp
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    var newPasswordVisible by remember { mutableStateOf(false) }
+                    var confirmPasswordVisible by remember { mutableStateOf(false) }
+
+                    OutlinedTextField(
+                        value = password,
+                        onValueChange = {
+                            password = it
+                            passwordError = false
+                        },
+                        label = { Text("New Password") },
+                        singleLine = true,
+                        visualTransformation = if (newPasswordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                        trailingIcon = {
+                            TextButton(onClick = { newPasswordVisible = !newPasswordVisible }) {
+                                Text(if (newPasswordVisible) "HIDE" else "SHOW", fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                            }
+                        },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password)
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    OutlinedTextField(
+                        value = confirmPassword,
+                        onValueChange = {
+                            confirmPassword = it
+                            passwordError = false
+                        },
+                        label = { Text("Confirm Password") },
+                        singleLine = true,
+                        visualTransformation = if (confirmPasswordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                        trailingIcon = {
+                            TextButton(onClick = { confirmPasswordVisible = !confirmPasswordVisible }) {
+                                Text(if (confirmPasswordVisible) "HIDE" else "SHOW", fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                            }
+                        },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password)
+                    )
+                    if (passwordError) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            "Passwords do not match or are empty.",
+                            color = MaterialTheme.colorScheme.error,
+                            fontSize = 13.sp
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    if (password.isNotBlank() && password == confirmPassword) {
+                        hiddenPasswordPrefs.edit()
+                            .putString(IQ200_HIDDEN_PASSWORD_KEY, password)
+                            .apply()
+
+                        showSetPasswordDialog = false
+                        password = ""
+                        confirmPassword = ""
+                        passwordError = false
+                        onUnlocked()
+                    } else {
+                        passwordError = true
+                    }
+                }) {
+                    Text("SAVE & OPEN")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    showSetPasswordDialog = false
+                    password = ""
+                    confirmPassword = ""
+                    passwordError = false
+                }) {
+                    Text("CANCEL")
+                }
+            }
+        )
+    }
+
     if (showPasswordDialog) {
         AlertDialog(
             onDismissRequest = {
@@ -1507,6 +2564,8 @@ fun Game2048Screen(
             title = { Text("Enter Password") },
             text = {
                 Column {
+                    var passwordVisible by remember { mutableStateOf(false) }
+
                     OutlinedTextField(
                         value = password,
                         onValueChange = {
@@ -1515,18 +2574,31 @@ fun Game2048Screen(
                         },
                         label = { Text("Password") },
                         singleLine = true,
-                        visualTransformation = PasswordVisualTransformation(),
+                        visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                        trailingIcon = {
+                            TextButton(onClick = { passwordVisible = !passwordVisible }) {
+                                Text(if (passwordVisible) "HIDE" else "SHOW", fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                            }
+                        },
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password)
                     )
                     if (passwordError) {
                         Spacer(modifier = Modifier.height(6.dp))
-                        Text("Wrong password", color = MaterialTheme.colorScheme.error, fontSize = 13.sp)
+                        Text(
+                            "Wrong password",
+                            color = MaterialTheme.colorScheme.error,
+                            fontSize = 13.sp
+                        )
                     }
                 }
             },
             confirmButton = {
                 Button(onClick = {
-                    if (password == LAKSHYA_HIDDEN_PASSWORD) {
+                    val savedPassword = hiddenPasswordPrefs
+                        .getString(IQ200_HIDDEN_PASSWORD_KEY, "")
+                        .orEmpty()
+
+                    if (password == savedPassword && savedPassword.isNotBlank()) {
                         showPasswordDialog = false
                         password = ""
                         passwordError = false
@@ -1636,6 +2708,110 @@ fun LakshyaApp() {
 
     var cloudSubscriptionLoading by remember {
         mutableStateOf(false)
+    }
+
+
+    // =====================================================
+    // AUTO LOGOUT - 20 MINUTES OF INACTIVITY
+    // =====================================================
+    var lastUserActivityAt by remember {
+        mutableLongStateOf(System.currentTimeMillis())
+    }
+
+    val rootView = LocalView.current
+
+    DisposableEffect(rootView, currentUserId) {
+        if (currentUserId.isBlank()) {
+            onDispose { }
+        } else {
+            lastUserActivityAt = System.currentTimeMillis()
+
+            val touchListener =
+                android.view.View.OnTouchListener { _, _ ->
+                    lastUserActivityAt = System.currentTimeMillis()
+                    false
+                }
+
+            rootView.setOnTouchListener(touchListener)
+
+            onDispose {
+                rootView.setOnTouchListener(null)
+            }
+        }
+    }
+
+    LaunchedEffect(currentUserId) {
+        if (currentUserId.isNotBlank()) {
+            lastUserActivityAt = System.currentTimeMillis()
+
+            while (currentUserId.isNotBlank()) {
+                kotlinx.coroutines.delay(1000L)
+
+                if (
+                    System.currentTimeMillis() - lastUserActivityAt >=
+                    20L * 60L * 1000L
+                ) {
+                    val logoutUserId = currentUserId
+                    val logoutRole = currentUserRole
+                    val logoutMasterUid = currentMasterUid
+
+                    SingleDeviceSessionManager.release(
+                        context = context,
+                        masterUid = logoutMasterUid,
+                        role = logoutRole,
+                        userId = logoutUserId
+                    ) {
+                        com.google.firebase.auth.FirebaseAuth
+                            .getInstance()
+                            .signOut()
+
+                        currentUserId = ""
+                        currentUserRole = ""
+                        currentMasterUid = ""
+                        cloudSubscriptionData = null
+                        currentEmployeePermissions.clear()
+                        currentScreen = "login"
+
+                        Toast.makeText(
+                            context,
+                            "Automatically logged out after 20 minutes of inactivity.",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+
+                    break
+                }
+            }
+        }
+    }
+
+    // =====================================================
+    // IQ200 - SINGLE DEVICE SESSION HEARTBEAT
+    // =====================================================
+    LaunchedEffect(
+        currentUserId,
+        currentUserRole,
+        currentMasterUid
+    ) {
+        if (
+            currentUserId.isNotBlank() &&
+            currentUserRole.isNotBlank() &&
+            currentMasterUid.isNotBlank()
+        ) {
+            while (
+                currentUserId.isNotBlank() &&
+                currentUserRole.isNotBlank() &&
+                currentMasterUid.isNotBlank()
+            ) {
+                SingleDeviceSessionManager.heartbeat(
+                    context = context,
+                    masterUid = currentMasterUid,
+                    role = currentUserRole,
+                    userId = currentUserId
+                )
+                kotlinx.coroutines.delay(20_000L)
+            }
+        }
     }
 
     // =====================================================
@@ -1788,21 +2964,206 @@ fun LakshyaApp() {
             ChukaraRateRuntime.config = ChukaraRateConfig()
             ChukaraRateRuntime.employeeRateAllowed = true
             onDispose { }
+        } else if (currentUserRole == "EMPLOYEE") {
+            val employeeUid =
+                com.google.firebase.auth.FirebaseAuth
+                    .getInstance()
+                    .currentUser
+                    ?.uid
+                    .orEmpty()
+
+            if (employeeUid.isBlank()) {
+                onDispose { }
+            } else {
+                // IMPORTANT: Employee rate realtime sync is handled ONLY
+                // through its own employee_lookup/{employeeUid} document.
+                // The old Master-UID rate listener is intentionally not
+                // attached here, so it cannot overwrite the Employee rate.
+                val firestore =
+                    com.google.firebase.firestore.FirebaseFirestore
+                        .getInstance()
+
+                val registration =
+                    firestore
+                        .collection("employee_lookup")
+                        .document(employeeUid)
+                        .addSnapshotListener { snapshot, error ->
+                            if (error != null || snapshot == null) {
+                                return@addSnapshotListener
+                            }
+
+                            // Update only when the mirrored Chukara fields
+                            // actually exist. This prevents a partial/stale
+                            // lookup update from resetting the Employee rate
+                            // back to defaults.
+                            if (
+                                snapshot.contains("chukaraRateEnabled") ||
+                                snapshot.contains("chukaraSingleRate") ||
+                                snapshot.contains("chukaraJodiRate") ||
+                                snapshot.contains("chukaraPanaRate")
+                            ) {
+                                ChukaraRateRuntime.config =
+                                    ChukaraRateConfig(
+                                        enabled =
+                                            snapshot.getBoolean("chukaraRateEnabled")
+                                                ?: ChukaraRateRuntime.config.enabled,
+                                        singleRate =
+                                            (
+                                                    snapshot.getLong("chukaraSingleRate")
+                                                        ?: ChukaraRateRuntime.config.singleRate.toLong()
+                                                    ).toInt(),
+                                        jodiRate =
+                                            (
+                                                    snapshot.getLong("chukaraJodiRate")
+                                                        ?: ChukaraRateRuntime.config.jodiRate.toLong()
+                                                    ).toInt(),
+                                        panaRate =
+                                            (
+                                                    snapshot.getLong("chukaraPanaRate")
+                                                        ?: ChukaraRateRuntime.config.panaRate.toLong()
+                                                    ).toInt()
+                                    )
+
+                                ChukaraRateRuntime.employeeRateAllowed =
+                                    currentEmployeePermissions["CHUKARA_RATE"] != false
+
+                                chukaraRateRefresh++
+                            }
+                        }
+
+                onDispose {
+                    registration.remove()
+                }
+            }
         } else {
+            // Master/Admin keeps the original Master UID listener unchanged.
             val registration =
                 ChukaraRateManager.listenRateConfig(
                     masterUid = currentMasterUid,
                     onUpdate = { config ->
-                        // Cloud value is the source of truth for every device.
                         ChukaraRateRuntime.config = config
-                        ChukaraRateRuntime.employeeRateAllowed =
-                            currentUserRole != "EMPLOYEE" ||
-                                    currentEmployeePermissions["CHUKARA_RATE"] != false
+                        ChukaraRateRuntime.employeeRateAllowed = true
                         chukaraRateRefresh++
                     },
                     onError = { /* Keep last known rate if temporarily offline. */ }
                 )
 
+            onDispose {
+                registration?.remove()
+            }
+        }
+    }
+
+    DisposableEffect(currentMasterUid, currentUserRole, currentUserId) {
+        if (currentMasterUid.isBlank()) {
+            ChukaraPrintAccessRuntime.config = ChukaraPrintAccessConfig()
+            ChukaraPrintAccessRuntime.configMasterUid = ""
+            ChukaraPrintAccessRuntime.employeeWithoutPrintAllowed = true
+            onDispose { }
+        } else if (currentUserRole == "EMPLOYEE" && currentUserId.isNotBlank()) {
+            val employeeUid =
+                com.google.firebase.auth.FirebaseAuth
+                    .getInstance()
+                    .currentUser
+                    ?.uid
+                    .orEmpty()
+
+            if (employeeUid.isBlank()) {
+                onDispose { }
+            } else {
+                // The Employee listens only to its own lookup document.
+                // This is the same employee_lookup document already read
+                // during Employee login, so it works on a separate device.
+                val lookupRef =
+                    com.google.firebase.firestore.FirebaseFirestore
+                        .getInstance()
+                        .collection("employee_lookup")
+                        .document(employeeUid)
+
+                val registration =
+                    lookupRef.addSnapshotListener { snapshot, error ->
+                        if (error != null || snapshot == null) return@addSnapshotListener
+
+                        val rateConfig = ChukaraRateConfig(
+                            enabled = snapshot.getBoolean("chukaraRateEnabled") ?: true,
+                            singleRate =
+                                (snapshot.getLong("chukaraSingleRate") ?: 9L)
+                                    .toInt().coerceIn(9, 10),
+                            jodiRate =
+                                (snapshot.getLong("chukaraJodiRate") ?: 8L)
+                                    .toInt().coerceAtLeast(8),
+                            panaRate =
+                                (snapshot.getLong("chukaraPanaRate") ?: 10L)
+                                    .toInt().coerceAtLeast(8)
+                        )
+
+                        ChukaraRateRuntime.config = rateConfig
+
+                        val masterWithoutPrint =
+                            snapshot.getBoolean("chukaraMasterWithoutPrint") == true
+
+                        val employeePrintExists =
+                            snapshot.contains("chukaraEmployeeWithPrint") ||
+                                    snapshot.contains("chukaraEmployeeWithoutPrint")
+
+                        val employeeWithPrint =
+                            snapshot.getBoolean("chukaraEmployeeWithPrint") ?: true
+                        val employeeWithoutPrint =
+                            snapshot.getBoolean("chukaraEmployeeWithoutPrint") ?: false
+
+                        val masterWithPrint =
+                            snapshot.getBoolean("chukaraMasterWithPrint") ?: true
+
+                        val effectivePrint =
+                            if (masterWithoutPrint) {
+                                ChukaraPrintAccessConfig(
+                                    withPrint = false,
+                                    withoutPrint = true,
+                                    authorizedPrinterId = "",
+                                    pairingCode = ""
+                                )
+                            } else if (employeePrintExists) {
+                                ChukaraPrintAccessConfig(
+                                    withPrint = employeeWithPrint,
+                                    withoutPrint = employeeWithoutPrint,
+                                    authorizedPrinterId =
+                                        snapshot.getString("chukaraEmployeePrinterId").orEmpty(),
+                                    pairingCode =
+                                        snapshot.getString("chukaraEmployeePairingCode").orEmpty()
+                                )
+                            } else {
+                                ChukaraPrintAccessConfig(
+                                    withPrint = masterWithPrint,
+                                    withoutPrint = false,
+                                    authorizedPrinterId =
+                                        snapshot.getString("chukaraMasterPrinterId").orEmpty(),
+                                    pairingCode =
+                                        snapshot.getString("chukaraMasterPairingCode").orEmpty()
+                                )
+                            }
+
+                        ChukaraPrintAccessRuntime.config = effectivePrint
+                        ChukaraPrintAccessRuntime.configMasterUid = currentMasterUid
+                        ChukaraPrintAccessRuntime.employeeWithoutPrintAllowed =
+                            effectivePrint.withoutPrint
+                        chukaraRateRefresh++
+                    }
+
+                onDispose {
+                    registration.remove()
+                }
+            }
+        } else {
+            val registration = ChukaraPrintAccessManager.listenConfig(
+                masterUid = currentMasterUid,
+                onUpdate = { config ->
+                    ChukaraPrintAccessRuntime.config = config
+                    ChukaraPrintAccessRuntime.configMasterUid = currentMasterUid
+                    ChukaraPrintAccessRuntime.employeeWithoutPrintAllowed = true
+                    chukaraRateRefresh++
+                },
+                onError = { }
+            )
             onDispose {
                 registration?.remove()
             }
@@ -2112,6 +3473,9 @@ fun LakshyaApp() {
 
         "printerSetup" -> {
             PrinterSetupScreen(
+                masterUid = currentMasterUid,
+                userId = currentUserId,
+                userRole = currentUserRole,
                 onBack = { currentScreen = if (currentUserRole == "ADMIN") "adminDashboard" else "dashboard" }
             )
         }
@@ -2216,7 +3580,7 @@ fun LakshyaApp() {
 
 
                     employeeLimit = data?.employeeLimit ?: 5,
-                    monthlyPrice = data?.monthlyPrice ?: 5000,
+                    monthlyPrice = data?.monthlyPrice ?: 10000,
 
                     onPayRenewClick = {
                         val limit = (data?.employeeLimit ?: 5).coerceIn(5, 10)
@@ -2226,7 +3590,7 @@ fun LakshyaApp() {
                                 paymentType = PaymentType.RENEWAL,
                                 currentEmployeeLimit = limit,
                                 selectedEmployeeLimit = limit,
-                                amount = limit * 1000
+                                amount = limit * 2000
                             )
                         )
                     },
@@ -2284,7 +3648,7 @@ fun LakshyaApp() {
             EmployeePlanUpgradeScreen(
                 isPlanActive = planIsActive,
                 currentEmployeeLimit = data?.employeeLimit ?: 5,
-                currentMonthlyPrice = data?.monthlyPrice ?: 5000,
+                currentMonthlyPrice = data?.monthlyPrice ?: 10000,
                 onContinuePayment = { selectedLimit, newMonthlyPrice, payNowAmount ->
                     val currentLimit =
                         (data?.employeeLimit ?: 5).coerceIn(5, 10)
@@ -2859,10 +4223,25 @@ fun LakshyaApp() {
                 },
 
                 onLogout = {
-                    currentUserId = ""
-                    currentUserRole = ""
-                    currentEmployeePermissions.clear()
-                    currentScreen = "login"
+                    val logoutUserId = currentUserId
+                    val logoutRole = currentUserRole
+                    val logoutMasterUid = currentMasterUid
+
+                    SingleDeviceSessionManager.release(
+                        context = context,
+                        masterUid = logoutMasterUid,
+                        role = logoutRole,
+                        userId = logoutUserId
+                    ) {
+                        com.google.firebase.auth.FirebaseAuth
+                            .getInstance()
+                            .signOut()
+
+                        currentUserId = ""
+                        currentUserRole = ""
+                        currentEmployeePermissions.clear()
+                        currentScreen = "login"
+                    }
                 }
             )
         }
@@ -2918,9 +4297,24 @@ fun LakshyaApp() {
                 },
 
                 onLogout = {
-                    currentUserId = ""
-                    currentUserRole = ""
-                    currentScreen = "login"
+                    val logoutUserId = currentUserId
+                    val logoutRole = currentUserRole
+                    val logoutMasterUid = currentMasterUid
+
+                    SingleDeviceSessionManager.release(
+                        context = context,
+                        masterUid = logoutMasterUid,
+                        role = logoutRole,
+                        userId = logoutUserId
+                    ) {
+                        com.google.firebase.auth.FirebaseAuth
+                            .getInstance()
+                            .signOut()
+
+                        currentUserId = ""
+                        currentUserRole = ""
+                        currentScreen = "login"
+                    }
                 }
             )
         }
@@ -3099,6 +4493,10 @@ fun LakshyaApp() {
                     it.status == "ACTIVE"
                 },
 
+                showExportLimitExcel =
+                    currentUserRole != "EMPLOYEE" ||
+                            (currentEmployeePermissions["EXCEL_EXPORT"] ?: true),
+
                 onBack = {
                     currentScreen =
                         if (currentUserRole == "ADMIN") {
@@ -3122,6 +4520,7 @@ fun LakshyaApp() {
                     entry = selectedEntry,
                     database = database,
                     currentUserId = currentUserId,
+                    currentUserRole = currentUserRole,
                     currentMasterUid = currentMasterUid,
                     savedEntries = savedEntries,
                     onUpdated = { updatedEntry ->
@@ -3164,6 +4563,8 @@ fun LakshyaApp() {
                 currentUserRole = currentUserRole,
 
                 currentMasterUid = currentMasterUid,
+
+                chukaraPrintAccessRefresh = chukaraRateRefresh,
 
                 permissions = currentEmployeePermissions,
 
@@ -3215,6 +4616,8 @@ fun LakshyaApp() {
                     database = database,
 
                     currentUserId = currentUserId,
+
+                    currentUserRole = currentUserRole,
 
                     currentMasterUid = currentMasterUid,
 
@@ -3608,7 +5011,7 @@ fun PaymentScreen(
                         "Upgrade",
                         "${request.currentEmployeeLimit} → ${request.selectedEmployeeLimit}"
                     )
-                    PaymentDetailRow("Rate", "₹1000 per added employee")
+                    PaymentDetailRow("Rate", "₹2000 per added employee")
                 }
 
                 if (paymentId.isNotBlank()) {
@@ -4048,12 +5451,20 @@ fun PublicCreateAccountScreen(
 
                 Spacer(Modifier.height(12.dp))
 
+                var createPasswordVisible by remember { mutableStateOf(false) }
+                var createConfirmPasswordVisible by remember { mutableStateOf(false) }
+
                 OutlinedTextField(
                     value = password,
                     onValueChange = { password = it },
                     modifier = Modifier.fillMaxWidth(),
                     label = { Text("Create Password") },
-                    visualTransformation = PasswordVisualTransformation(),
+                    visualTransformation = if (createPasswordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                    trailingIcon = {
+                        TextButton(onClick = { createPasswordVisible = !createPasswordVisible }) {
+                            Text(if (createPasswordVisible) "HIDE" else "SHOW", fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                        }
+                    },
                     singleLine = true
                 )
 
@@ -4064,7 +5475,12 @@ fun PublicCreateAccountScreen(
                     onValueChange = { confirmPassword = it },
                     modifier = Modifier.fillMaxWidth(),
                     label = { Text("Confirm Password") },
-                    visualTransformation = PasswordVisualTransformation(),
+                    visualTransformation = if (createConfirmPasswordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                    trailingIcon = {
+                        TextButton(onClick = { createConfirmPasswordVisible = !createConfirmPasswordVisible }) {
+                            Text(if (createConfirmPasswordVisible) "HIDE" else "SHOW", fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                        }
+                    },
                     singleLine = true
                 )
             }
@@ -4227,8 +5643,8 @@ fun PublicChoosePlanScreen(
 
     val baseLimit = 5
     val maxLimit = 10
-    val basePrice = 5000
-    val perEmployee = 1000
+    val basePrice = 10000
+    val perEmployee = 2000
 
     var selectedLimit by remember {
         mutableIntStateOf(baseLimit)
@@ -4340,11 +5756,11 @@ fun PublicChoosePlanScreen(
                 Spacer(Modifier.height(18.dp))
 
                 Text(
-                    "5 Employees = ₹5,000/month",
+                    "5 Employees = ₹10,000/month",
                     modifier = Modifier.fillMaxWidth()
                 )
                 Text(
-                    "+1 Employee = ₹1,000/month",
+                    "+1 Employee = ₹2,000/month",
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(top = 7.dp)
@@ -4654,16 +6070,46 @@ fun LoginScreen(
                                             MasterAccessManager.verifyMasterAccess(
                                                 masterUid = masterUid,
                                                 onAllowed = { cloudSubscription ->
-                                                    Toast.makeText(
-                                                        context,
-                                                        "Master Admin Login Successful",
-                                                        Toast.LENGTH_SHORT
-                                                    ).show()
+                                                    SingleDeviceSessionManager.acquire(
+                                                        context = context,
+                                                        masterUid = masterUid,
+                                                        role = "ADMIN",
+                                                        userId = "ADMIN",
+                                                        onSuccess = {
+                                                            Toast.makeText(
+                                                                context,
+                                                                "Master Admin Login Successful",
+                                                                Toast.LENGTH_SHORT
+                                                            ).show()
 
-                                                    onLoginSuccess(
-                                                        "ADMIN",
-                                                        "ADMIN",
-                                                        masterUid
+                                                            onLoginSuccess(
+                                                                "ADMIN",
+                                                                "ADMIN",
+                                                                masterUid
+                                                            )
+                                                        },
+                                                        onBlocked = { message ->
+                                                            com.google.firebase.auth.FirebaseAuth
+                                                                .getInstance()
+                                                                .signOut()
+
+                                                            Toast.makeText(
+                                                                context,
+                                                                message,
+                                                                Toast.LENGTH_LONG
+                                                            ).show()
+                                                        },
+                                                        onError = { message ->
+                                                            com.google.firebase.auth.FirebaseAuth
+                                                                .getInstance()
+                                                                .signOut()
+
+                                                            Toast.makeText(
+                                                                context,
+                                                                message,
+                                                                Toast.LENGTH_LONG
+                                                            ).show()
+                                                        }
                                                     )
                                                 },
                                                 onBlocked = { cloudSubscription ->
@@ -4906,16 +6352,46 @@ fun LoginScreen(
                                                                     }
 
                                                                     // Login success only after ALL checks pass.
-                                                                    Toast.makeText(
-                                                                        context,
-                                                                        "Employee Login Successful",
-                                                                        Toast.LENGTH_SHORT
-                                                                    ).show()
+                                                                    SingleDeviceSessionManager.acquire(
+                                                                        context = context,
+                                                                        masterUid = masterUid,
+                                                                        role = "EMPLOYEE",
+                                                                        userId = cloudEmployee.userId,
+                                                                        onSuccess = {
+                                                                            Toast.makeText(
+                                                                                context,
+                                                                                "Employee Login Successful",
+                                                                                Toast.LENGTH_SHORT
+                                                                            ).show()
 
-                                                                    onLoginSuccess(
-                                                                        cloudEmployee.userId,
-                                                                        "EMPLOYEE",
-                                                                        masterUid
+                                                                            onLoginSuccess(
+                                                                                cloudEmployee.userId,
+                                                                                "EMPLOYEE",
+                                                                                masterUid
+                                                                            )
+                                                                        },
+                                                                        onBlocked = { message ->
+                                                                            com.google.firebase.auth.FirebaseAuth
+                                                                                .getInstance()
+                                                                                .signOut()
+
+                                                                            Toast.makeText(
+                                                                                context,
+                                                                                message,
+                                                                                Toast.LENGTH_LONG
+                                                                            ).show()
+                                                                        },
+                                                                        onError = { message ->
+                                                                            com.google.firebase.auth.FirebaseAuth
+                                                                                .getInstance()
+                                                                                .signOut()
+
+                                                                            Toast.makeText(
+                                                                                context,
+                                                                                message,
+                                                                                Toast.LENGTH_LONG
+                                                                            ).show()
+                                                                        }
                                                                     )
                                                                 }
                                                                 .addOnFailureListener { error ->
@@ -5094,12 +6570,20 @@ fun LoginScreen(
                     )
                     Spacer(Modifier.height(10.dp))
 
+                    var newPasswordVisible by remember { mutableStateOf(false) }
+                    var confirmPasswordVisible by remember { mutableStateOf(false) }
+
                     OutlinedTextField(
                         value = newPassword,
                         onValueChange = { newPassword = it },
                         modifier = Modifier.fillMaxWidth(),
                         label = { Text("Create Password") },
-                        visualTransformation = PasswordVisualTransformation(),
+                        visualTransformation = if (newPasswordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                        trailingIcon = {
+                            TextButton(onClick = { newPasswordVisible = !newPasswordVisible }) {
+                                Text(if (newPasswordVisible) "HIDE" else "SHOW", fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                            }
+                        },
                         singleLine = true
                     )
                     Spacer(Modifier.height(10.dp))
@@ -5109,7 +6593,12 @@ fun LoginScreen(
                         onValueChange = { confirmPassword = it },
                         modifier = Modifier.fillMaxWidth(),
                         label = { Text("Confirm Password") },
-                        visualTransformation = PasswordVisualTransformation(),
+                        visualTransformation = if (confirmPasswordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                        trailingIcon = {
+                            TextButton(onClick = { confirmPasswordVisible = !confirmPasswordVisible }) {
+                                Text(if (confirmPasswordVisible) "HIDE" else "SHOW", fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                            }
+                        },
                         singleLine = true
                     )
                     Spacer(Modifier.height(12.dp))
@@ -6212,7 +7701,7 @@ fun calculateHistoricalChukara(
                 if (isWin) {
 
                     val chukaraAmount =
-                        calculateConfiguredChukara(entry)
+                        calculateConfiguredChukara(entry, savedEntry.isPrinted)
 
                     wins.add(
                         WinningChukara(
@@ -7390,6 +8879,38 @@ fun SuperMasterScreen(
         mutableStateOf(false)
     }
 
+    var printControlCustomer by remember {
+        mutableStateOf<SuperMasterCustomer?>(null)
+    }
+
+    var printControlSaving by remember {
+        mutableStateOf(false)
+    }
+
+    var controlWithoutPrint by remember {
+        mutableStateOf(false)
+    }
+
+    var controlPrinterId by remember {
+        mutableStateOf("")
+    }
+
+    var controlPairingCode by remember {
+        mutableStateOf("")
+    }
+
+    var employeeControlMaster by remember {
+        mutableStateOf<SuperMasterCustomer?>(null)
+    }
+
+    var employeeControlRows by remember {
+        mutableStateOf<List<EmployeeChukaraPrintAccessConfig>>(emptyList())
+    }
+
+    var employeeControlLoading by remember {
+        mutableStateOf(false)
+    }
+
     BackHandler {
         onBack()
     }
@@ -7813,6 +9334,59 @@ fun SuperMasterScreen(
 
                         Spacer(Modifier.height(8.dp))
 
+                        // The Super Master account also needs its own printer
+                        // authorization.  A printer removed from another Master is
+                        // released, but it is not automatically assigned here.
+                        OutlinedButton(
+                            onClick = {
+                                printControlCustomer = customer
+                                controlWithoutPrint = customer.chukaraWithoutPrint
+                                controlPrinterId = customer.authorizedPrinterId
+                                controlPairingCode = customer.printerPairingCode
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                "CHUKARA PRINT CONTROL",
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+
+                        Spacer(Modifier.height(8.dp))
+
+                        if (customer.masterUid != LAKSHYA_SUPER_MASTER_UID) {
+                            OutlinedButton(
+                                onClick = {
+                                    employeeControlMaster = customer
+                                    employeeControlRows = emptyList()
+                                    employeeControlLoading = true
+                                    SuperMasterCloudManager.getEmployeePrintControls(
+                                        masterUid = customer.masterUid,
+                                        onSuccess = { rows ->
+                                            employeeControlRows = rows
+                                            employeeControlLoading = false
+                                        },
+                                        onError = { message ->
+                                            employeeControlLoading = false
+                                            Toast.makeText(
+                                                context,
+                                                message,
+                                                Toast.LENGTH_LONG
+                                            ).show()
+                                        }
+                                    )
+                                },
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text(
+                                    "EMPLOYEE PRINT STATUS",
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+
+                        Spacer(Modifier.height(8.dp))
+
                         if (
                             active &&
                             customer.masterUid != LAKSHYA_SUPER_MASTER_UID
@@ -8021,7 +9595,7 @@ fun SuperMasterScreen(
 
                     PaymentDetailRow(
                         "Monthly Plan",
-                        "₹${manualEmployeeLimit * 1000}"
+                        "₹${manualEmployeeLimit * 2000}"
                     )
 
                     PaymentDetailRow(
@@ -8085,6 +9659,306 @@ fun SuperMasterScreen(
                         manualActivationCustomer = null
                     },
                     enabled = !manualActivationLoading
+                ) {
+                    Text("CANCEL")
+                }
+            }
+        )
+    }
+
+    employeeControlMaster?.let { customer ->
+        AlertDialog(
+            onDismissRequest = {
+                if (!employeeControlLoading) employeeControlMaster = null
+            },
+            title = {
+                Text("EMPLOYEE PRINT STATUS", fontWeight = FontWeight.Bold)
+            },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    Text(
+                        customer.businessName.ifBlank { customer.masterUid },
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color(0xFF163A5F)
+                    )
+                    Spacer(Modifier.height(10.dp))
+
+                    if (employeeControlLoading) {
+                        Box(
+                            modifier = Modifier.fillMaxWidth().padding(25.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            CircularProgressIndicator()
+                        }
+                    } else if (employeeControlRows.isEmpty()) {
+                        Text(
+                            "No employee print-control records saved yet.",
+                            fontSize = 13.sp,
+                            color = Color.Gray
+                        )
+                    } else {
+                        employeeControlRows.forEach { row ->
+                            Card(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 4.dp)
+                            ) {
+                                Column(Modifier.padding(12.dp)) {
+                                    Text(
+                                        row.employeeName.ifBlank { row.employeeUserId.ifBlank { row.employeeUid } },
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                    if (row.employeeUserId.isNotBlank()) {
+                                        Text(row.employeeUserId, fontSize = 11.sp, color = Color.Gray)
+                                    }
+                                    Spacer(Modifier.height(5.dp))
+                                    Text(
+                                        if (row.withoutPrint) "WITHOUT PRINT" else "WITH PRINT",
+                                        fontWeight = FontWeight.Bold,
+                                        color = if (row.withoutPrint) Color(0xFF168447) else Color(0xFF163A5F)
+                                    )
+                                    if (!row.withoutPrint) {
+                                        var superEmployeePrinterId by remember(row.employeeUid, row.authorizedPrinterId) {
+                                            mutableStateOf(row.authorizedPrinterId)
+                                        }
+                                        var superEmployeePairingCode by remember(row.employeeUid, row.pairingCode) {
+                                            mutableStateOf(row.pairingCode)
+                                        }
+                                        var superEmployeeSaving by remember(row.employeeUid) {
+                                            mutableStateOf(false)
+                                        }
+
+                                        Spacer(Modifier.height(8.dp))
+
+                                        OutlinedTextField(
+                                            value = superEmployeePrinterId,
+                                            onValueChange = { superEmployeePrinterId = it },
+                                            label = { Text("AUTHORIZED PRINTER MAC") },
+                                            supportingText = {
+                                                Text("Only this printer will work for this Employee.")
+                                            },
+                                            modifier = Modifier.fillMaxWidth(),
+                                            singleLine = true,
+                                            enabled = !superEmployeeSaving
+                                        )
+
+                                        Spacer(Modifier.height(8.dp))
+
+                                        OutlinedTextField(
+                                            value = superEmployeePairingCode,
+                                            onValueChange = { superEmployeePairingCode = it },
+                                            label = { Text("PRINTER PAIRING CODE") },
+                                            supportingText = {
+                                                Text("Assigned by Super Master only.")
+                                            },
+                                            modifier = Modifier.fillMaxWidth(),
+                                            singleLine = true,
+                                            enabled = !superEmployeeSaving
+                                        )
+
+                                        Spacer(Modifier.height(8.dp))
+
+                                        Button(
+                                            enabled = !superEmployeeSaving,
+                                            onClick = {
+                                                superEmployeeSaving = true
+                                                EmployeeChukaraPrintAccessManager.saveConfig(
+                                                    masterUid = customer.masterUid,
+                                                    employeeUid = row.employeeUid,
+                                                    employeeUserId = row.employeeUserId,
+                                                    employeeName = row.employeeName,
+                                                    withPrint = row.withPrint,
+                                                    withoutPrint = row.withoutPrint,
+                                                    authorizedPrinterId = superEmployeePrinterId,
+                                                    pairingCode = superEmployeePairingCode,
+                                                    onSuccess = {
+                                                        superEmployeeSaving = false
+                                                        Toast.makeText(
+                                                            context,
+                                                            "EMPLOYEE PRINTER CONTROL SAVED",
+                                                            Toast.LENGTH_SHORT
+                                                        ).show()
+                                                        employeeControlRows = employeeControlRows.map {
+                                                            if (it.employeeUid == row.employeeUid) {
+                                                                it.copy(
+                                                                    authorizedPrinterId = superEmployeePrinterId.trim().uppercase(),
+                                                                    pairingCode = superEmployeePairingCode.trim()
+                                                                )
+                                                            } else it
+                                                        }
+                                                    },
+                                                    onError = { message ->
+                                                        superEmployeeSaving = false
+                                                        Toast.makeText(
+                                                            context,
+                                                            message,
+                                                            Toast.LENGTH_LONG
+                                                        ).show()
+                                                    }
+                                                )
+                                            },
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            if (superEmployeeSaving) {
+                                                CircularProgressIndicator(
+                                                    modifier = Modifier.size(18.dp),
+                                                    strokeWidth = 2.dp
+                                                )
+                                            } else {
+                                                Text("SAVE PRINTER CONTROL")
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = { employeeControlMaster = null },
+                    enabled = !employeeControlLoading
+                ) {
+                    Text("CLOSE")
+                }
+            }
+        )
+    }
+
+    printControlCustomer?.let { customer ->
+        AlertDialog(
+            onDismissRequest = {
+                if (!printControlSaving) printControlCustomer = null
+            },
+            title = {
+                Text("CHUKARA PRINT CONTROL", fontWeight = FontWeight.Bold)
+            },
+            text = {
+                Column(
+                    modifier = Modifier.verticalScroll(rememberScrollState())
+                ) {
+                    Text(
+                        customer.businessName.ifBlank { customer.masterUid },
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color(0xFF163A5F)
+                    )
+
+                    Spacer(Modifier.height(12.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text("CHUKARA WITHOUT PRINT", fontWeight = FontWeight.Bold)
+                            Text(
+                                "ON = Chukara can be taken without printing.",
+                                fontSize = 11.sp,
+                                color = Color.Gray
+                            )
+                        }
+                        Switch(
+                            checked = controlWithoutPrint,
+                            onCheckedChange = { controlWithoutPrint = it }
+                        )
+                    }
+
+                    Spacer(Modifier.height(12.dp))
+
+                    Text(
+                        if (controlWithoutPrint)
+                            "Current mode: WITHOUT PRINT"
+                        else
+                            "Current mode: WITH PRINT",
+                        fontWeight = FontWeight.Bold
+                    )
+
+                    Spacer(Modifier.height(12.dp))
+
+                    OutlinedTextField(
+                        value = controlPrinterId,
+                        onValueChange = { controlPrinterId = it },
+                        label = { Text("AUTHORIZED PRINTER ID / MAC") },
+                        supportingText = {
+                            Text("Only this printer identifier will be accepted.")
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true
+                    )
+
+                    Spacer(Modifier.height(10.dp))
+
+                    OutlinedTextField(
+                        value = controlPairingCode,
+                        onValueChange = { controlPairingCode = it },
+                        label = { Text("PRINTER PAIRING CODE") },
+                        supportingText = {
+                            Text("Code assigned by Super Master to this Master account.")
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true
+                    )
+
+                    Spacer(Modifier.height(8.dp))
+
+                    Text(
+                        "With Print ON: Chukara requires the authorized printer. " +
+                                "Without Print ON: printer is not required.",
+                        fontSize = 12.sp,
+                        color = Color.Gray
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    enabled = !printControlSaving,
+                    onClick = {
+                        printControlSaving = true
+                        SuperMasterCloudManager.saveChukaraPrintControl(
+                            masterUid = customer.masterUid,
+                            withoutPrint = controlWithoutPrint,
+                            authorizedPrinterId = controlPrinterId,
+                            pairingCode = controlPairingCode,
+                            onSuccess = {
+                                printControlSaving = false
+                                printControlCustomer = null
+                                Toast.makeText(
+                                    context,
+                                    "CHUKARA PRINT CONTROL SAVED",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                                refreshKey++
+                            },
+                            onError = { message ->
+                                printControlSaving = false
+                                Toast.makeText(
+                                    context,
+                                    message,
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            }
+                        )
+                    }
+                ) {
+                    if (printControlSaving) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(18.dp),
+                            strokeWidth = 2.dp
+                        )
+                    } else {
+                        Text("SAVE CONTROL")
+                    }
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { printControlCustomer = null },
+                    enabled = !printControlSaving
                 ) {
                     Text("CANCEL")
                 }
@@ -9382,8 +11256,8 @@ fun EmployeePlanUpgradeScreen(
 ) {
     val baseLimit = 5
     val maxLimit = 10
-    val basePrice = 5000
-    val perEmployeePrice = 1000
+    val basePrice = 10000
+    val perEmployeePrice = 2000
 
     val safeCurrentLimit = currentEmployeeLimit.coerceIn(baseLimit, maxLimit)
 
@@ -9454,7 +11328,7 @@ fun EmployeePlanUpgradeScreen(
                         color = MaterialTheme.colorScheme.error,
                         fontWeight = FontWeight.Bold
                     )
-                    Text("New plan starts from 5 Employees • ₹5,000/month")
+                    Text("New plan starts from 5 Employees • ₹10,000/month")
                 }
             }
         }
@@ -9520,7 +11394,7 @@ fun EmployeePlanUpgradeScreen(
                 Spacer(Modifier.height(18.dp))
 
                 Text(
-                    "+1 Employee = ₹1,000/month",
+                    "+1 Employee = ₹2,000/month",
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.primary
                 )
@@ -9677,6 +11551,30 @@ fun ManageEmployeesScreen(
     var selectedEmployeeProfile by remember { mutableStateOf<EmployeeEntity?>(null) }
 
     var employeePendingDeletion by remember { mutableStateOf<EmployeeEntity?>(null) }
+
+    var employeePrintControl by remember {
+        mutableStateOf<EmployeeEntity?>(null)
+    }
+
+    var employeePrintSaving by remember {
+        mutableStateOf(false)
+    }
+
+    var employeeControlWithPrint by remember {
+        mutableStateOf(true)
+    }
+
+    var employeeControlWithoutPrint by remember {
+        mutableStateOf(false)
+    }
+
+    var employeeControlPrinterId by remember {
+        mutableStateOf("")
+    }
+
+    var employeeControlPairingCode by remember {
+        mutableStateOf("")
+    }
 
     var showEmployeeLimitDialog by remember {
         mutableStateOf(false)
@@ -9869,6 +11767,8 @@ fun ManageEmployeesScreen(
             modifier = Modifier.height(10.dp)
         )
 
+        var passwordVisible by remember { mutableStateOf(false) }
+
         OutlinedTextField(
             value = password,
             onValueChange = {
@@ -9878,7 +11778,12 @@ fun ManageEmployeesScreen(
                 Text("Password")
             },
             visualTransformation =
-                PasswordVisualTransformation(),
+                if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+            trailingIcon = {
+                TextButton(onClick = { passwordVisible = !passwordVisible }) {
+                    Text(if (passwordVisible) "HIDE" else "SHOW", fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                }
+            },
             modifier = Modifier.fillMaxWidth()
         )
 
@@ -10023,6 +11928,11 @@ fun ManageEmployeesScreen(
                                                                 userId = cleanUserId,
                                                                 authEmail = employeeEmail,
                                                                 onSuccess = {
+                                                                    ChukaraEmployeeRealtimeSync.syncNewEmployee(
+                                                                        masterUid = masterUid,
+                                                                        employeeUid = employeeUid
+                                                                    )
+
                                                                     /*
                                                                      * Do NOT insert the employee into Room here.
                                                                      *
@@ -10291,6 +12201,84 @@ fun ManageEmployeesScreen(
                         Spacer(modifier = Modifier.height(8.dp))
 
                         OutlinedButton(
+                            onClick = {
+                                employeePrintControl = employee
+                                employeePrintSaving = false
+                                employeeControlWithPrint = true
+                                employeeControlWithoutPrint = false
+                                employeeControlPrinterId = ""
+                                employeeControlPairingCode = ""
+
+                                // EmployeeEntity does not store Firebase UID locally.
+                                // Resolve the cloud employee document by its User ID.
+                                com.google.firebase.firestore.FirebaseFirestore
+                                    .getInstance()
+                                    .collection("masters")
+                                    .document(masterUid)
+                                    .collection("employees")
+                                    .whereEqualTo("userId", employee.userId.trim().uppercase())
+                                    .limit(1)
+                                    .get()
+                                    .addOnSuccessListener { snapshot ->
+                                        val doc = snapshot.documents.firstOrNull()
+                                        val employeeUid = doc?.id.orEmpty()
+
+                                        if (employeeUid.isBlank()) {
+                                            Toast.makeText(
+                                                context,
+                                                "Cloud employee not found",
+                                                Toast.LENGTH_LONG
+                                            ).show()
+                                            employeePrintControl = null
+                                            return@addOnSuccessListener
+                                        }
+
+                                        val fallback =
+                                            EmployeeChukaraPrintAccessConfig(
+                                                employeeUid = employeeUid,
+                                                employeeUserId = employee.userId.trim().uppercase(),
+                                                employeeName = employee.employeeName,
+                                                withPrint = ChukaraPrintAccessRuntime.config.withPrint,
+                                                withoutPrint = ChukaraPrintAccessRuntime.config.withoutPrint,
+                                                authorizedPrinterId = "",
+                                                pairingCode = ""
+                                            )
+
+                                        EmployeeChukaraPrintAccessManager.getConfig(
+                                            masterUid = masterUid,
+                                            employeeUid = employeeUid,
+                                            fallback = fallback,
+                                            onSuccess = { config ->
+                                                employeeControlWithPrint = config.withPrint
+                                                employeeControlWithoutPrint = config.withoutPrint
+                                                employeeControlPrinterId = config.authorizedPrinterId
+                                                employeeControlPairingCode = config.pairingCode
+                                            },
+                                            onError = { message ->
+                                                Toast.makeText(
+                                                    context,
+                                                    message,
+                                                    Toast.LENGTH_LONG
+                                                ).show()
+                                            }
+                                        )
+                                    }
+                                    .addOnFailureListener { error ->
+                                        Toast.makeText(
+                                            context,
+                                            error.message ?: "Unable to load employee printer control",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                    }
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("CHUKARA PRINT CONTROL")
+                        }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        OutlinedButton(
                             onClick = { employeePendingDeletion = employee },
                             modifier = Modifier.fillMaxWidth()
                         ) {
@@ -10343,7 +12331,7 @@ fun ManageEmployeesScreen(
                         )
                         Spacer(Modifier.height(6.dp))
                         Text(
-                            "+1 Employee = ₹1,000/month",
+                            "+1 Employee = ₹2,000/month",
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.primary
                         )
@@ -10383,6 +12371,183 @@ fun ManageEmployeesScreen(
                     ) {
                         Text("NOT NOW")
                     }
+                }
+            }
+        )
+    }
+
+    employeePrintControl?.let { employee ->
+        AlertDialog(
+            onDismissRequest = {
+                if (!employeePrintSaving) employeePrintControl = null
+            },
+            title = {
+                Text("CHUKARA PRINT CONTROL", fontWeight = FontWeight.Bold)
+            },
+            text = {
+                Column(
+                    modifier = Modifier.verticalScroll(rememberScrollState())
+                ) {
+                    Text(
+                        employee.employeeName.ifBlank { employee.userId },
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFF163A5F)
+                    )
+                    Text(
+                        "Employee ID: ${employee.userId}",
+                        fontSize = 12.sp,
+                        color = Color.Gray
+                    )
+
+                    Spacer(Modifier.height(12.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text("WITH PRINT", fontWeight = FontWeight.Bold)
+                            Text(
+                                "ON = Chukara requires this employee's authorized printer.",
+                                fontSize = 11.sp,
+                                color = Color.Gray
+                            )
+                        }
+                        Switch(
+                            checked = employeeControlWithPrint,
+                            onCheckedChange = {
+                                employeeControlWithPrint = it
+                                if (it) employeeControlWithoutPrint = false
+                            }
+                        )
+                    }
+
+                    Spacer(Modifier.height(8.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text("WITHOUT PRINT", fontWeight = FontWeight.Bold)
+                            Text(
+                                "ON = this employee can take Chukara without printing.",
+                                fontSize = 11.sp,
+                                color = Color.Gray
+                            )
+                        }
+                        Switch(
+                            checked = employeeControlWithoutPrint,
+                            onCheckedChange = {
+                                employeeControlWithoutPrint = it
+                                if (it) employeeControlWithPrint = false
+                            }
+                        )
+                    }
+
+                    Spacer(Modifier.height(12.dp))
+
+                    Text(
+                        if (employeeControlWithoutPrint)
+                            "This Employee is using WITHOUT PRINT. No printer is required."
+                        else
+                            "This Employee is using WITH PRINT. The printer MAC and pairing code are assigned only by Super Master.",
+                        fontSize = 12.sp,
+                        color = Color.Gray
+                    )
+
+                    Spacer(Modifier.height(8.dp))
+
+                    Text(
+                        "Printer authorization is locked by Super Master.",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color(0xFF163A5F)
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    enabled = !employeePrintSaving,
+                    onClick = {
+                        employeePrintSaving = true
+
+                        // Resolve Firebase employee UID again before saving.
+                        com.google.firebase.firestore.FirebaseFirestore
+                            .getInstance()
+                            .collection("masters")
+                            .document(masterUid)
+                            .collection("employees")
+                            .whereEqualTo("userId", employee.userId.trim().uppercase())
+                            .limit(1)
+                            .get()
+                            .addOnSuccessListener { snapshot ->
+                                val employeeUid = snapshot.documents.firstOrNull()?.id.orEmpty()
+
+                                if (employeeUid.isBlank()) {
+                                    employeePrintSaving = false
+                                    Toast.makeText(
+                                        context,
+                                        "Cloud employee not found",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                    return@addOnSuccessListener
+                                }
+
+                                EmployeeChukaraPrintAccessManager.saveConfig(
+                                    masterUid = masterUid,
+                                    employeeUid = employeeUid,
+                                    employeeUserId = employee.userId,
+                                    employeeName = employee.employeeName,
+                                    withPrint = employeeControlWithPrint,
+                                    withoutPrint = employeeControlWithoutPrint,
+                                    authorizedPrinterId = employeeControlPrinterId,
+                                    pairingCode = employeeControlPairingCode,
+                                    onSuccess = {
+                                        employeePrintSaving = false
+                                        employeePrintControl = null
+                                        Toast.makeText(
+                                            context,
+                                            "EMPLOYEE CHUKARA PRINT CONTROL SAVED",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                    },
+                                    onError = { message ->
+                                        employeePrintSaving = false
+                                        Toast.makeText(
+                                            context,
+                                            message,
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                    }
+                                )
+                            }
+                            .addOnFailureListener { error ->
+                                employeePrintSaving = false
+                                Toast.makeText(
+                                    context,
+                                    error.message ?: "Unable to find employee",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            }
+                    }
+                ) {
+                    if (employeePrintSaving) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(18.dp),
+                            strokeWidth = 2.dp
+                        )
+                    } else {
+                        Text("SAVE CONTROL")
+                    }
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { employeePrintControl = null },
+                    enabled = !employeePrintSaving
+                ) {
+                    Text("CANCEL")
                 }
             }
         )
@@ -10907,6 +13072,7 @@ fun TodayDashboardScreen(
 
     savedEntries: List<SavedEntry>,
 
+    showExportLimitExcel: Boolean,
     onBack: () -> Unit
 
 ) {
@@ -11046,28 +13212,30 @@ fun TodayDashboardScreen(
             modifier = Modifier.height(15.dp)
         )
 
-        Button(
-            onClick = {
-                coroutineScope.launch {
-                    try {
-                        val fileName = exportLimitExcel(context, savedEntries)
-                        Toast.makeText(
-                            context,
-                            "Excel saved: Downloads/Lakshya/$fileName",
-                            Toast.LENGTH_LONG
-                        ).show()
-                    } catch (e: Exception) {
-                        Toast.makeText(
-                            context,
-                            "Excel export failed: ${e.message}",
-                            Toast.LENGTH_LONG
-                        ).show()
+        if (showExportLimitExcel) {
+            Button(
+                onClick = {
+                    coroutineScope.launch {
+                        try {
+                            val fileName = exportLimitExcel(context, savedEntries)
+                            Toast.makeText(
+                                context,
+                                "Excel saved: Downloads/Lakshya/$fileName",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        } catch (e: Exception) {
+                            Toast.makeText(
+                                context,
+                                "Excel export failed: ${e.message}",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        }
                     }
-                }
-            },
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("EXPORT LIMIT EXCEL")
+                },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("EXPORT LIMIT EXCEL")
+            }
         }
 
         Spacer(modifier = Modifier.height(15.dp))
@@ -11673,6 +13841,8 @@ fun SearchReportsScreen(
 
     currentMasterUid: String,
 
+    chukaraPrintAccessRefresh: Int,
+
     permissions: Map<String, Boolean>,
 
     onEditEntry: (SavedEntry) -> Unit,
@@ -11683,6 +13853,11 @@ fun SearchReportsScreen(
 
     val context =
         LocalContext.current
+
+    // Recompose this screen whenever the live Master/Employee Chukara
+    // print-control configuration changes. The calculation below reads
+    // ChukaraPrintAccessRuntime, which is a non-Compose runtime object.
+    chukaraPrintAccessRefresh
 
     fun employeeAllowed(key: String): Boolean =
         currentUserRole == "ADMIN" ||
@@ -11715,25 +13890,10 @@ fun SearchReportsScreen(
             onDispose { }
         } else {
             val resultRegistration =
-                CloudAccountSyncManager.listenLiveResults(
+                CloudResultManager.listenResults(
                     masterUid = currentMasterUid,
                     onUpdate = { liveResults, resultTimes ->
-                        val editor = resultPrefs.edit()
-
-                        resultGames().forEach { game ->
-                            val value = liveResults[game].orEmpty()
-                            val time = resultTimes[game] ?: 0L
-
-                            if (value.isBlank()) {
-                                editor.remove(game)
-                                editor.remove("RESULT_TIME_$game")
-                            } else {
-                                editor.putString(game, value)
-                                editor.putLong("RESULT_TIME_$game", time)
-                            }
-                        }
-
-                        editor.apply()
+                        syncLiveResultsToPrefs(resultPrefs, liveResults, resultTimes)
                         paidRefresh++
                     },
                     onError = { }
@@ -12760,6 +14920,8 @@ fun EditEntryScreen(
 
     currentUserId: String,
 
+    currentUserRole: String,
+
     currentMasterUid: String,
 
     savedEntries:
@@ -12848,25 +15010,10 @@ fun EditEntryScreen(
             onDispose { }
         } else {
             val registration =
-                CloudAccountSyncManager.listenLiveResults(
+                CloudResultManager.listenResults(
                     masterUid = currentMasterUid,
                     onUpdate = { liveResults, resultTimes ->
-                        val editor = editResultPrefs.edit()
-
-                        resultGames().forEach { game ->
-                            val value = liveResults[game].orEmpty()
-                            val time = resultTimes[game] ?: 0L
-
-                            if (value.isBlank()) {
-                                editor.remove(game)
-                                editor.remove("RESULT_TIME_$game")
-                            } else {
-                                editor.putString(game, value)
-                                editor.putLong("RESULT_TIME_$game", time)
-                            }
-                        }
-
-                        editor.apply()
+                        syncLiveResultsToPrefs(editResultPrefs, liveResults, resultTimes)
                         editResultRefresh++
                     },
                     onError = { }
@@ -13363,25 +15510,10 @@ fun NewEntryScreen(
             onDispose { }
         } else {
             val registration =
-                CloudAccountSyncManager.listenLiveResults(
+                CloudResultManager.listenResults(
                     masterUid = currentMasterUid,
                     onUpdate = { liveResults, resultTimes ->
-                        val editor = resultPrefs.edit()
-
-                        resultGames().forEach { game ->
-                            val value = liveResults[game].orEmpty()
-                            val time = resultTimes[game] ?: 0L
-
-                            if (value.isBlank()) {
-                                editor.remove(game)
-                                editor.remove("RESULT_TIME_$game")
-                            } else {
-                                editor.putString(game, value)
-                                editor.putLong("RESULT_TIME_$game", time)
-                            }
-                        }
-
-                        editor.apply()
+                        syncLiveResultsToPrefs(resultPrefs, liveResults, resultTimes)
                         cloudResultRefresh++
                     },
                     onError = { }
@@ -14430,6 +16562,9 @@ private const val PRINTER_PREFS = "lakshya_printer"
 private const val PRINTER_MAC = "printer_mac"
 private val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
 
+private fun normalizedPrinterId(value: String): String =
+    value.trim().uppercase().replace(":", "").replace("-", "").replace(" ", "")
+
 @SuppressLint("MissingPermission")
 fun hasBluetoothConnectPermission(context: android.content.Context): Boolean {
     return Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
@@ -14437,14 +16572,81 @@ fun hasBluetoothConnectPermission(context: android.content.Context): Boolean {
 }
 
 @SuppressLint("MissingPermission")
-fun sendTextToSavedPrinter(context: android.content.Context, text: String): Result<Unit> {
+fun sendTextToSavedPrinter(
+    context: android.content.Context,
+    text: String,
+    expectedMasterUid: String = "",
+    expectedUserId: String = "",
+    expectedUserRole: String = ""
+): Result<Unit> {
     return runCatching {
         if (!hasBluetoothConnectPermission(context)) error("Bluetooth permission not allowed")
         val adapter = BluetoothAdapter.getDefaultAdapter() ?: error("Bluetooth not supported")
         if (!adapter.isEnabled) error("Bluetooth is OFF")
-        val mac = context.getSharedPreferences(PRINTER_PREFS, android.content.Context.MODE_PRIVATE)
-            .getString(PRINTER_MAC, "").orEmpty()
+        val prefs = context.getSharedPreferences(
+            "${PRINTER_PREFS}_${expectedUserRole.ifBlank { "ADMIN" }}_${expectedUserId.ifBlank { expectedMasterUid }}",
+            android.content.Context.MODE_PRIVATE
+        )
+        val mac = prefs.getString(PRINTER_MAC, "").orEmpty()
         if (mac.isBlank()) error("Printer not connected. Open Printer Setup first")
+
+        val access = ChukaraPrintAccessRuntime.config
+        val authorized = access.authorizedPrinterId
+        val savedMasterUid = prefs.getString("printer_master_uid", "").orEmpty()
+        val savedUserId = prefs.getString("printer_user_id", "").orEmpty()
+        val savedUserRole = prefs.getString("printer_user_role", "").orEmpty()
+
+        if (access.withoutPrint) {
+            error("WITHOUT PRINT IS ON. PRINTER USE IS DISABLED.")
+        }
+
+        if (!access.withPrint) {
+            error("CHUKARA WITH PRINT IS OFF.")
+        }
+
+        if (ChukaraPrintAccessRuntime.configMasterUid.isBlank() ||
+            savedMasterUid.isBlank() ||
+            savedMasterUid != ChukaraPrintAccessRuntime.configMasterUid
+        ) {
+            error("PRINTER IS NOT ASSIGNED TO THIS MASTER ACCOUNT")
+        }
+
+        if (expectedUserId.isNotBlank() &&
+            savedUserId.isNotBlank() &&
+            !savedUserId.equals(expectedUserId, ignoreCase = true)
+        ) {
+            error("PRINTER IS NOT ASSIGNED TO THIS USER")
+        }
+
+        if (expectedUserRole.isNotBlank() &&
+            savedUserRole.isNotBlank() &&
+            !savedUserRole.equals(expectedUserRole, ignoreCase = true)
+        ) {
+            error("PRINTER IS NOT ASSIGNED TO THIS USER ROLE")
+        }
+
+        // Use the authenticated UID too: the displayed/master context can be
+        // temporarily stale while an account is being restored after login.
+        val isSuperMaster =
+            expectedMasterUid == LAKSHYA_SUPER_MASTER_UID ||
+                    com.google.firebase.auth.FirebaseAuth
+                        .getInstance()
+                        .currentUser
+                        ?.uid == LAKSHYA_SUPER_MASTER_UID
+
+        // Super Master is the printer authority. It may use a printer after
+        // releasing it from another Master; it does not need to first assign
+        // the same MAC back to its own account.
+        if (!isSuperMaster) {
+            if (authorized.isBlank()) {
+                error("NO AUTHORIZED PRINTER ASSIGNED BY SUPER MASTER")
+            }
+
+            if (normalizedPrinterId(mac) != normalizedPrinterId(authorized)) {
+                error("UNAUTHORIZED PRINTER. Only the Master-authorized printer can be used.")
+            }
+        }
+
         val device = adapter.getRemoteDevice(mac)
         adapter.cancelDiscovery()
         device.createRfcommSocketToServiceRecord(SPP_UUID).use { socket ->
@@ -14460,15 +16662,161 @@ fun sendTextToSavedPrinter(context: android.content.Context, text: String): Resu
 
 @SuppressLint("MissingPermission")
 @Composable
-fun PrinterSetupScreen(onBack: () -> Unit) {
+fun PrinterSetupScreen(
+    masterUid: String,
+    userId: String,
+    userRole: String,
+    onBack: () -> Unit
+) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val adapter = remember { BluetoothAdapter.getDefaultAdapter() }
-    val prefs = remember { context.getSharedPreferences(PRINTER_PREFS, android.content.Context.MODE_PRIVATE) }
+    val prefs = remember(userRole, userId) {
+        context.getSharedPreferences(
+            "${PRINTER_PREFS}_${userRole}_${userId.ifBlank { masterUid }}",
+            android.content.Context.MODE_PRIVATE
+        )
+    }
     var devices by remember { mutableStateOf<List<BluetoothDevice>>(emptyList()) }
     var selectedMac by remember { mutableStateOf(prefs.getString(PRINTER_MAC, "").orEmpty()) }
     var status by remember { mutableStateOf(if (selectedMac.isBlank()) "NO PRINTER CONNECTED" else "SAVED PRINTER: $selectedMac") }
     var busy by remember { mutableStateOf(false) }
+    // masterUid is normally the authenticated UID. Checking Firebase Auth as
+    // well prevents a stale restored UI state from treating Super Master as a
+    // normal Master and showing an unauthorized-printer error.
+    val isSuperMaster =
+        masterUid == LAKSHYA_SUPER_MASTER_UID ||
+                com.google.firebase.auth.FirebaseAuth
+                    .getInstance()
+                    .currentUser
+                    ?.uid == LAKSHYA_SUPER_MASTER_UID
+
+    DisposableEffect(masterUid, userRole, userId) {
+        if (masterUid.isBlank()) {
+            ChukaraPrintAccessRuntime.config = ChukaraPrintAccessConfig()
+            ChukaraPrintAccessRuntime.configMasterUid = ""
+            onDispose { }
+        } else if (userRole == "EMPLOYEE" && userId.isNotBlank()) {
+            val employeeUid =
+                com.google.firebase.auth.FirebaseAuth
+                    .getInstance()
+                    .currentUser
+                    ?.uid
+                    .orEmpty()
+
+            var employeeRegistration: com.google.firebase.firestore.ListenerRegistration? = null
+
+            val masterRegistration = ChukaraPrintAccessManager.listenConfig(
+                masterUid = masterUid,
+                onUpdate = { masterConfig ->
+                    val fallback = EmployeeChukaraPrintAccessConfig(
+                        employeeUid = employeeUid,
+                        employeeUserId = userId,
+                        employeeName = "",
+                        withPrint = masterConfig.withPrint,
+                        withoutPrint = masterConfig.withoutPrint,
+                        authorizedPrinterId = "",
+                        pairingCode = ""
+                    )
+
+                    employeeRegistration?.remove()
+                    employeeRegistration =
+                        EmployeeChukaraPrintAccessManager.listenConfig(
+                            masterUid = masterUid,
+                            employeeUid = employeeUid,
+                            fallback = fallback,
+                            onUpdate = { employeeConfig ->
+                                ChukaraPrintAccessRuntime.config =
+                                    ChukaraPrintAccessConfig(
+                                        withPrint = employeeConfig.withPrint,
+                                        withoutPrint = employeeConfig.withoutPrint,
+                                        authorizedPrinterId = employeeConfig.authorizedPrinterId,
+                                        pairingCode = employeeConfig.pairingCode
+                                    )
+                                ChukaraPrintAccessRuntime.configMasterUid = masterUid
+
+                                val authorized = employeeConfig.authorizedPrinterId
+                                val localMac = prefs.getString(PRINTER_MAC, "").orEmpty()
+
+                                if (employeeConfig.withoutPrint ||
+                                    authorized.isBlank() ||
+                                    (localMac.isNotBlank() &&
+                                            normalizedPrinterId(localMac) != normalizedPrinterId(authorized))
+                                ) {
+                                    prefs.edit()
+                                        .remove(PRINTER_MAC)
+                                        .remove("printer_master_uid")
+                                        .apply()
+                                    selectedMac = ""
+                                    status = if (employeeConfig.withoutPrint) {
+                                        "WITHOUT PRINT ON — PRINTER DISABLED"
+                                    } else {
+                                        "NO EMPLOYEE AUTHORIZED PRINTER"
+                                    }
+                                } else if (localMac.isNotBlank()) {
+                                    status = "AUTHORIZED EMPLOYEE PRINTER: $localMac"
+                                }
+                            },
+                            onError = { message ->
+                                status = "EMPLOYEE PRINTER CONTROL LOAD FAILED: $message"
+                            }
+                        )
+                },
+                onError = { message ->
+                    status = "MASTER PRINTER CONTROL LOAD FAILED: $message"
+                }
+            )
+
+            onDispose {
+                masterRegistration?.remove()
+                employeeRegistration?.remove()
+            }
+        } else {
+            val registration = ChukaraPrintAccessManager.listenConfig(
+                masterUid = masterUid,
+                onUpdate = { config ->
+                    ChukaraPrintAccessRuntime.config = config
+                    ChukaraPrintAccessRuntime.configMasterUid = masterUid
+
+                    val authorized = config.authorizedPrinterId
+                    val localMac = prefs.getString(PRINTER_MAC, "").orEmpty()
+
+                    // A blank authorizedPrinterId means a normal Master has
+                    // released its assigned printer. It must clear that
+                    // Master's local pairing, but it must NOT clear Super
+                    // Master's own printer: Super Master is the authority and
+                    // can immediately reuse a released printer.
+                    if (!isSuperMaster &&
+                        (config.withoutPrint ||
+                                authorized.isBlank() ||
+                                (localMac.isNotBlank() &&
+                                        normalizedPrinterId(localMac) != normalizedPrinterId(authorized)))
+                    ) {
+                        prefs.edit()
+                            .remove(PRINTER_MAC)
+                            .remove("printer_master_uid")
+                            .remove("printer_user_id")
+                            .remove("printer_user_role")
+                            .apply()
+                        selectedMac = ""
+                        status = if (config.withoutPrint) {
+                            "WITHOUT PRINT ON — PRINTER DISABLED"
+                        } else {
+                            "NO AUTHORIZED PRINTER ASSIGNED"
+                        }
+                    } else if (localMac.isNotBlank()) {
+                        status = "AUTHORIZED PRINTER: $localMac"
+                    }
+                },
+                onError = { message ->
+                    status = "PRINTER CONTROL LOAD FAILED: $message"
+                }
+            )
+            onDispose {
+                registration?.remove()
+            }
+        }
+    }
 
     fun requestBluetoothPermission() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !hasBluetoothConnectPermission(context)) {
@@ -14520,13 +16868,36 @@ fun PrinterSetupScreen(onBack: () -> Unit) {
             Spacer(Modifier.height(8.dp))
             devices.forEach { device ->
                 val mac = device.address
+                val access = ChukaraPrintAccessRuntime.config
+                val authorizedPrinterId = access.authorizedPrinterId
+                val isAuthorized =
+                    !access.withoutPrint && access.withPrint &&
+                            (isSuperMaster ||
+                                    (authorizedPrinterId.isNotBlank() &&
+                                            normalizedPrinterId(mac) == normalizedPrinterId(authorizedPrinterId)))
+
                 OutlinedButton(
-                    onClick = { selectedMac = mac; status = "Selected: ${device.name ?: "Bluetooth Device"}" },
+                    onClick = {
+                        if (isAuthorized) {
+                            selectedMac = mac
+                            status = "Selected: ${device.name ?: "Bluetooth Device"}"
+                        } else {
+                            status = "UNAUTHORIZED PRINTER — NOT ALLOWED"
+                        }
+                    },
+                    enabled = isAuthorized,
                     modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
                 ) {
                     Column(Modifier.fillMaxWidth()) {
                         Text(device.name ?: "Bluetooth Device", fontWeight = FontWeight.Bold)
                         Text(mac, fontSize = 11.sp)
+                        if (!isAuthorized) {
+                            Text(
+                                "NOT AUTHORIZED",
+                                fontSize = 10.sp,
+                                color = MaterialTheme.colorScheme.error
+                            )
+                        }
                     }
                 }
             }
@@ -14534,7 +16905,14 @@ fun PrinterSetupScreen(onBack: () -> Unit) {
 
         Spacer(Modifier.height(14.dp))
         Button(
-            enabled = selectedMac.isNotBlank() && !busy,
+            enabled = selectedMac.isNotBlank() &&
+                    !busy &&
+                    ChukaraPrintAccessRuntime.config.withPrint &&
+                    !ChukaraPrintAccessRuntime.config.withoutPrint &&
+                    (isSuperMaster ||
+                            (ChukaraPrintAccessRuntime.config.authorizedPrinterId.isNotBlank() &&
+                                    normalizedPrinterId(selectedMac) ==
+                                    normalizedPrinterId(ChukaraPrintAccessRuntime.config.authorizedPrinterId))),
             onClick = {
                 busy = true
                 scope.launch(kotlinx.coroutines.Dispatchers.IO) {
@@ -14542,8 +16920,35 @@ fun PrinterSetupScreen(onBack: () -> Unit) {
                         if (!hasBluetoothConnectPermission(context)) error("Bluetooth permission not allowed")
                         val device = adapter?.getRemoteDevice(selectedMac) ?: error("Bluetooth unavailable")
                         adapter.cancelDiscovery()
+
+                        val access = ChukaraPrintAccessRuntime.config
+                        val authorized = access.authorizedPrinterId
+
+                        if (access.withoutPrint) {
+                            error("WITHOUT PRINT IS ON. PRINTER CONNECTION IS DISABLED.")
+                        }
+
+                        if (!access.withPrint) {
+                            error("CHUKARA WITH PRINT IS OFF.")
+                        }
+
+                        if (!isSuperMaster) {
+                            if (authorized.isBlank()) {
+                                error("NO AUTHORIZED PRINTER ASSIGNED BY SUPER MASTER")
+                            }
+
+                            if (normalizedPrinterId(selectedMac) != normalizedPrinterId(authorized)) {
+                                error("UNAUTHORIZED PRINTER. Only the Master-authorized printer can be connected.")
+                            }
+                        }
+
                         device.createRfcommSocketToServiceRecord(SPP_UUID).use { socket -> socket.connect() }
-                        prefs.edit().putString(PRINTER_MAC, selectedMac).apply()
+                        prefs.edit()
+                            .putString(PRINTER_MAC, selectedMac)
+                            .putString("printer_master_uid", masterUid)
+                            .putString("printer_user_id", userId)
+                            .putString("printer_user_role", userRole)
+                            .apply()
                     }
                     kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
                         busy = false
@@ -14562,7 +16967,10 @@ fun PrinterSetupScreen(onBack: () -> Unit) {
                 scope.launch(kotlinx.coroutines.Dispatchers.IO) {
                     val result = sendTextToSavedPrinter(
                         context,
-                        "LAKSHYA\nPRINTER TEST\n------------------------------\nPrinter Connected Successfully\n\n"
+                        "LAKSHYA\nPRINTER TEST\n------------------------------\nPrinter Connected Successfully\n\n",
+                        expectedMasterUid = masterUid,
+                        expectedUserId = userId,
+                        expectedUserRole = userRole
                     )
                     kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
                         busy = false
@@ -14574,7 +16982,13 @@ fun PrinterSetupScreen(onBack: () -> Unit) {
         ) { Text("TEST PRINT") }
 
         Spacer(Modifier.height(18.dp))
-        Text("Note: First pair your thermal printer from the phone's Bluetooth settings. Then use SEARCH PRINTER here.", fontSize = 12.sp)
+        Text(
+            if (userRole == "EMPLOYEE")
+                "Only the printer authorized for this Employee by the Master can be selected and used."
+            else
+                "Only the printer authorized for this Master account can be selected and used.",
+            fontSize = 12.sp
+        )
         Spacer(Modifier.height(18.dp))
         OutlinedButton(onClick = onBack, modifier = Modifier.fillMaxWidth()) { Text("BACK") }
     }
@@ -14593,6 +17007,8 @@ fun PrintPreviewScreen(
     database: AppDatabase,
 
     currentUserId: String,
+
+    currentUserRole: String,
 
     currentMasterUid: String,
 
@@ -15018,7 +17434,13 @@ fun PrintPreviewScreen(
                     }
                     printed = true
                     val printResult = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                        sendTextToSavedPrinter(context, receiptText)
+                        sendTextToSavedPrinter(
+                            context,
+                            receiptText,
+                            expectedMasterUid = currentMasterUid,
+                            expectedUserId = currentUserId,
+                            expectedUserRole = currentUserRole
+                        )
                     }
                     if (printResult.isFailure) {
                         database.billDao().releasePrintReservation(
@@ -15115,9 +17537,7 @@ fun parseGames(
         .filter {
             it.isNotEmpty()
         }
-        .filter {
-            it in gameList
-        }
+        .filter { isValidGameCode(it) }
         .distinct()
 }
 
@@ -15145,11 +17565,16 @@ fun findInvalidGames(
         .filter {
             it.isNotEmpty()
         }
-        .filter {
-            it !in gameList
-        }
+        .filter { !isValidGameCode(it) }
         .distinct()
 }
+
+/**
+ * Games are user-defined codes. Spaces and commas separate multiple games,
+ * so a code itself may contain only letters, digits, '_' or '-'.
+ */
+fun isValidGameCode(game: String): Boolean =
+    Regex("^[A-Z0-9_-]{2,20}$").matches(game)
 
 
 // =====================================================
@@ -15587,11 +18012,13 @@ fun deserializeEntries(
 // =====================================================
 
 private fun hindiSlipCustomerName(name: String): String {
-    return try {
-        Transliterator.getInstance("Latin-Devanagari").transliterate(name)
-    } catch (_: Exception) {
-        // The original name is safer than failing the receipt if a device does
-        // not provide the ICU transliterator.
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        try {
+            Transliterator.getInstance("Latin-Devanagari").transliterate(name)
+        } catch (_: Exception) {
+            name
+        }
+    } else {
         name
     }
 }
@@ -16187,9 +18614,10 @@ fun calculateEntryChukara(
 ): List<WinningChukara> {
     if (savedEntry.status != "ACTIVE") return emptyList()
 
-    // CHUKARA ONLY AFTER SUCCESSFUL PRINT.
-    // No print = no Chukara.
-    if (!savedEntry.isPrinted) return emptyList()
+    val printAccess = ChukaraPrintAccessRuntime.config
+    if (printAccess.withPrint && !printAccess.withoutPrint && !savedEntry.isPrinted) {
+        return emptyList()
+    }
 
     val wins = mutableListOf<WinningChukara>()
 
@@ -16303,7 +18731,7 @@ fun calculateEntryChukara(
 
             if (isWin) {
                 val chukaraAmount =
-                    calculateConfiguredChukara(entry)
+                    calculateConfiguredChukara(entry, savedEntry.isPrinted)
                 val key = "${savedEntry.id}|$game|${entry.entryType}|${entry.number}|$index|$result"
                 wins.add(
                     WinningChukara(
@@ -16347,6 +18775,32 @@ fun resultDisplayName(game: String): String {
 fun resultGames(): List<String> = listOf(
     "MO", "NO", "RDO", "KO", "KNO", "RO", "MBO"
 )
+
+private const val LIVE_RESULT_GAMES_KEY = "LIVE_RESULT_GAMES"
+
+/** Keeps fixed and user-created game results in the same local result store. */
+fun syncLiveResultsToPrefs(
+    prefs: android.content.SharedPreferences,
+    liveResults: Map<String, String>,
+    resultTimes: Map<String, Long>
+): Set<String> {
+    val games = (prefs.getStringSet(LIVE_RESULT_GAMES_KEY, emptySet()).orEmpty() +
+            resultGames() + liveResults.keys)
+        .filter(::isValidGameCode)
+        .toSet()
+    val editor = prefs.edit()
+    games.forEach { game ->
+        val result = liveResults[game].orEmpty()
+        if (result.isBlank()) {
+            editor.remove(game).remove("RESULT_TIME_$game")
+        } else {
+            editor.putString(game, result)
+            editor.putLong("RESULT_TIME_$game", resultTimes[game] ?: 0L)
+        }
+    }
+    editor.putStringSet(LIVE_RESULT_GAMES_KEY, games).apply()
+    return games
+}
 
 
 fun closeGameForOpenGame(openGame: String): String? {
@@ -16795,7 +19249,7 @@ fun ResultScreen(
             android.content.Context.MODE_PRIVATE
         )
     }
-    val games = remember { resultGames() }
+    val games = remember { mutableStateListOf<String>().apply { addAll(resultGames()) } }
     val results = remember(currentMasterUid) {
         mutableStateMapOf<String, String>().apply {
             games.forEach { game ->
@@ -16804,6 +19258,7 @@ fun ResultScreen(
         }
     }
     var selectedGame by remember { mutableStateOf(games.first()) }
+    var gameCodeInput by remember { mutableStateOf(selectedGame) }
     var resultInput by remember { mutableStateOf(results[selectedGame].orEmpty()) }
     var gameMenuExpanded by remember { mutableStateOf(false) }
     var historyGame by remember { mutableStateOf<String?>(null) }
@@ -16826,123 +19281,45 @@ fun ResultScreen(
         if (currentMasterUid.isBlank()) {
             onDispose { }
         } else {
-            // PRIMARY real-time source: shared live-result document.
-            val liveRegistration =
-                CloudAccountSyncManager.listenLiveResults(
+            // RESULT REALTIME SOURCE:
+            // Use the same CloudResultManager listener that receives the Master's
+            // exact Firestore result document. Do NOT use a device-local
+            // DELETED_RESULT flag here; a local flag can otherwise block a new
+            // Master result forever on that Employee device.
+            val directResultRegistration =
+                CloudResultManager.listenResults(
                     masterUid = currentMasterUid,
                     onUpdate = { liveResults, resultTimes ->
-                        val editor = prefs.edit()
-
-                        games.forEach { game ->
-                            val value = liveResults[game].orEmpty()
-                            val time = resultTimes[game] ?: 0L
-
-                            if (value.isBlank()) {
-                                editor.remove(game)
-                                editor.remove("RESULT_TIME_$game")
-                            } else {
-                                editor.putString(game, value)
-                                editor.putLong("RESULT_TIME_$game", time)
-                            }
-
-                            results[game] = value
+                        val syncedGames = syncLiveResultsToPrefs(
+                            prefs, liveResults, resultTimes
+                        )
+                        syncedGames.forEach { game ->
+                            if (game !in games) games.add(game)
+                            results[game] = prefs.getString(game, "").orEmpty()
                         }
 
-                        editor.apply()
+                        // Any cloud update is authoritative. Clear any stale
+                        // device-local delete marker so the next update is accepted.
+                        prefs.edit().apply {
+                            syncedGames.forEach { remove("DELETED_RESULT_$it") }
+                        }.apply()
+
+                        // IMPORTANT: update the visible Result field too.
+                        // The old problem was that the map could change while the
+                        // TextField could keep its previous remembered value.
                         resultInput = results[selectedGame].orEmpty()
+
                         historyRefresh++
                     },
-                    onError = {
-                        // The results collection listener below is also kept active
-                        // as a fallback for Employee IDs.
+                    onError = { message ->
+                        // Keep the Result screen usable even if a transient
+                        // listener error occurs.
+                        android.util.Log.w(
+                            "LakshyaResult",
+                            "Realtime result sync: $message"
+                        )
                     }
                 )
-
-            // IMPORTANT EMPLOYEE FIX:
-            // Listen directly to masters/{masterUid}/results too.
-            // This makes ADMIN -> EMPLOYEE declaration work even when the
-            // separate live-result document is delayed/unavailable.
-            val directResultRegistration =
-                com.google.firebase.firestore.FirebaseFirestore
-                    .getInstance()
-                    .collection("masters")
-                    .document(currentMasterUid)
-                    .collection("results")
-                    .addSnapshotListener { snapshot, error ->
-                        if (error != null || snapshot == null) {
-                            return@addSnapshotListener
-                        }
-
-                        val latestByGame =
-                            snapshot.documents
-                                .mapNotNull { document ->
-                                    val game =
-                                        document.getString("game")
-                                            .orEmpty()
-                                            .trim()
-                                            .uppercase()
-
-                                    val result =
-                                        document.getString("result")
-                                            .orEmpty()
-                                            .trim()
-
-                                    val savedTime =
-                                        document.getLong("savedTime") ?: 0L
-
-                                    val currentBusinessDayStart =
-                                        dayArchivePrefs.getLong(
-                                            "CURRENT_DAY_START",
-                                            0L
-                                        )
-
-                                    if (
-                                        game.isBlank() ||
-                                        result.isBlank() ||
-                                        savedTime <= 0L ||
-                                        (
-                                                currentBusinessDayStart > 0L &&
-                                                        savedTime < currentBusinessDayStart
-                                                )
-                                    ) {
-                                        null
-                                    } else {
-                                        Triple(game, result, savedTime)
-                                    }
-                                }
-                                .groupBy { it.first }
-                                .mapValues { (_, rows) ->
-                                    rows.maxByOrNull { it.third }
-                                }
-
-                        val editor = prefs.edit()
-
-                        games.forEach { game ->
-                            val row = latestByGame[game]
-
-                            if (row != null) {
-                                editor.putString(game, row.second)
-                                editor.putLong(
-                                    "RESULT_TIME_$game",
-                                    row.third
-                                )
-                                results[game] = row.second
-                            } else {
-                                // `results` is permanent history. Once CLOSE DAY
-                                // starts a new business cycle, old rows are filtered
-                                // above; clear their stale value from the live Result
-                                // screen instead of leaving yesterday's result visible.
-                                editor.remove(game)
-                                editor.remove("RESULT_TIME_$game")
-                                results[game] = ""
-                            }
-                        }
-
-                        editor.apply()
-                        resultInput =
-                            results[selectedGame].orEmpty()
-                        historyRefresh++
-                    }
 
             val historyRegistration =
                 CloudAccountSyncManager.listenResultHistory(
@@ -16967,8 +19344,7 @@ fun ResultScreen(
                 )
 
             onDispose {
-                liveRegistration?.remove()
-                directResultRegistration.remove()
+                directResultRegistration?.remove()
                 historyRegistration?.remove()
             }
         }
@@ -17539,6 +19915,7 @@ fun ResultScreen(
                             text = { Text(resultDisplayName(game)) },
                             onClick = {
                                 selectedGame = game
+                                gameCodeInput = game
                                 resultInput = results[game].orEmpty()
                                 gameMenuExpanded = false
                             }
@@ -17546,6 +19923,25 @@ fun ResultScreen(
                     }
                 }
             }
+            Spacer(modifier = Modifier.height(10.dp))
+            OutlinedTextField(
+                value = gameCodeInput,
+                onValueChange = { value ->
+                    val code = value.uppercase()
+                        .filter { it.isLetterOrDigit() || it == '_' || it == '-' }
+                        .take(20)
+                    gameCodeInput = code
+                    if (isValidGameCode(code)) {
+                        selectedGame = code
+                        if (code !in games) games.add(code)
+                        resultInput = results[code].orEmpty()
+                    }
+                },
+                label = { Text("Game code (new game allowed)") },
+                supportingText = { Text("Example: XYZ or MY-GAME") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth()
+            )
             Spacer(modifier = Modifier.height(10.dp))
             OutlinedTextField(
                 value = resultInput,
@@ -17560,6 +19956,10 @@ fun ResultScreen(
             Spacer(modifier = Modifier.height(10.dp))
             Button(
                 onClick = {
+                    if (!isValidGameCode(selectedGame)) {
+                        Toast.makeText(context, "Enter a valid game code first", Toast.LENGTH_LONG).show()
+                        return@Button
+                    }
                     val clean = resultInput.trim()
                     if (!isValidLakshyaResult(clean)) {
                         Toast.makeText(context, "Open: 123-6 OR Full: 123-65-230", Toast.LENGTH_LONG).show()
@@ -17670,12 +20070,21 @@ fun ResultScreen(
                         targetTime = resultHistoryTime
                     )
 
+                    // A new SAVE/UPDATE starts a fresh live-result state.
+                    // Clear the local delete marker so the newly saved result can
+                    // be accepted by the realtime listeners.
+                    prefs.edit()
+                        .remove("DELETED_RESULT_$selectedGame")
+                        .apply()
+
                     // Result is also saved under this Master's cloud account.
                     CloudResultManager.saveResult(
                         masterUid = currentMasterUid,
                         game = selectedGame,
                         result = clean,
-                        savedTime = resultHistoryTime,
+                        // MO/KO must use the current declaration time for cloud sync.
+                        // Their history timestamp can remain unchanged.
+                        savedTime = if (selectedGame == "MO" || selectedGame == "KO") now else resultHistoryTime,
                         onSuccess = {
                             // FULL result also declares the paired CLOSE game
                             // for every Employee ID under the same Master UID.
@@ -17728,6 +20137,7 @@ fun ResultScreen(
                                 if (closeGame != null) {
                                     remove(closeGame)
                                     remove("RESULT_TIME_$closeGame")
+                                    putBoolean("DELETED_RESULT_$closeGame", true)
                                 }
                             }
                             .apply()
@@ -17737,12 +20147,29 @@ fun ResultScreen(
                         CloudResultManager.deleteResult(
                             masterUid = currentMasterUid,
                             game = selectedGame,
+                            onSuccess = {
+                                prefs.edit()
+                                    .remove(selectedGame)
+                                    .remove("RESULT_TIME_$selectedGame")
+                                    .apply()
+                                results[selectedGame] = ""
+                            },
                             onError = { message ->
                                 Toast.makeText(context, "Local result deleted. Cloud: $message", Toast.LENGTH_LONG).show()
                             }
                         )
                         if (closeGame != null) {
-                            CloudResultManager.deleteResult(currentMasterUid, closeGame)
+                            CloudResultManager.deleteResult(
+                                currentMasterUid,
+                                closeGame,
+                                onSuccess = {
+                                    prefs.edit()
+                                        .remove(closeGame)
+                                        .remove("RESULT_TIME_$closeGame")
+                                        .apply()
+                                    results[closeGame] = ""
+                                }
+                            )
                         }
                         historyRefresh++
                         Toast.makeText(context, "${resultDisplayName(selectedGame)} result deleted", Toast.LENGTH_SHORT).show()
@@ -17962,25 +20389,10 @@ fun ProfitLossScreen(
             onDispose { }
         } else {
             val registration =
-                CloudAccountSyncManager.listenLiveResults(
+                CloudResultManager.listenResults(
                     masterUid = currentMasterUid,
                     onUpdate = { liveResults, resultTimes ->
-                        val editor = resultPrefs.edit()
-
-                        resultGames().forEach { game ->
-                            val value = liveResults[game].orEmpty()
-                            val time = resultTimes[game] ?: 0L
-
-                            if (value.isBlank()) {
-                                editor.remove(game)
-                                editor.remove("RESULT_TIME_$game")
-                            } else {
-                                editor.putString(game, value)
-                                editor.putLong("RESULT_TIME_$game", time)
-                            }
-                        }
-
-                        editor.apply()
+                        syncLiveResultsToPrefs(resultPrefs, liveResults, resultTimes)
                         resultRefresh++
                     },
                     onError = { }

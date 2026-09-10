@@ -22,7 +22,7 @@ fun SubscriptionScreen(
     expiryDate: String,
     daysRemaining: Long,
     employeeLimit: Int = 5,
-    monthlyPrice: Int = 5000,
+    monthlyPrice: Int = 10000,
     onPayRenewClick: () -> Unit,
     onUpgradeClick: () -> Unit,
     onBackClick: () -> Unit
@@ -444,7 +444,7 @@ fun SubscriptionScreen(
 
                 PlanDetailRow(
                     title = "Additional Employee",
-                    value = "₹1,000 / Month"
+                    value = "₹2,000 / Month"
                 )
 
                 Spacer(modifier = Modifier.height(14.dp))
@@ -489,7 +489,7 @@ fun SubscriptionScreen(
 
                     Text(
                         text =
-                            "Increase your employee limit up to 10. Each additional employee adds ₹1,000/month to your plan.",
+                            "Increase your employee limit up to 10. Each additional employee adds ₹2,000/month to your plan.",
                         color = Color.DarkGray,
                         fontSize = 13.sp
                     )
