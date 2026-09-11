@@ -62,6 +62,7 @@ data class CloudBill(
     val printedBy: String = "",
     val printedTime: Long? = null,
     val printCount: Int = 0,
+    val chukaraAllowedWithoutPrint: Boolean = false,
 
     val isDayLocked: Boolean = false,
     val dayLockedBy: String = "",
@@ -215,6 +216,8 @@ object CloudBillManager {
                 entry.printedTime,
 
             printCount = entry.printCount,
+
+            chukaraAllowedWithoutPrint = entry.chukaraAllowedWithoutPrint,
 
             isDayLocked =
                 entry.isDayLocked,

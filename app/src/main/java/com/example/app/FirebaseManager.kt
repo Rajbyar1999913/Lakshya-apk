@@ -76,64 +76,10 @@ object FirebaseManager {
                     return@addOnSuccessListener
                 }
 
-                firestore
-                    .collection("masters")
-                    .document(uid)
-                    .get()
-                    .addOnSuccessListener { document ->
-
-                        if (!document.exists()) {
-
-                            auth.signOut()
-
-                            onError(
-                                "Master Admin record not found"
-                            )
-
-                            return@addOnSuccessListener
-                        }
-
-                        val role =
-                            document.getString("role")
-                                ?: ""
-
-                        val active =
-                            document.getBoolean("isActive")
-                                ?: false
-
-                        if (role != "ADMIN") {
-
-                            auth.signOut()
-
-                            onError(
-                                "This account is not a Master Admin"
-                            )
-
-                            return@addOnSuccessListener
-                        }
-
-                        if (!active) {
-
-                            auth.signOut()
-
-                            onError(
-                                "Master Admin account is inactive"
-                            )
-
-                            return@addOnSuccessListener
-                        }
-
-                        onSuccess(uid)
-                    }
-                    .addOnFailureListener { error ->
-
-                        auth.signOut()
-
-                        onError(
-                            error.message
-                                ?: "Master verification failed"
-                        )
-                    }
+                // MasterAccessManager immediately performs the authoritative
+                // master + subscription check. Avoid a duplicate serial read
+                // here so a valid login reaches the dashboard faster.
+                onSuccess(uid)
             }
             .addOnFailureListener { error ->
 
@@ -168,6 +114,7 @@ object FirebaseManager {
         employeeName: String,
         userId: String,
         authEmail: String,
+        mobile: String,
         onSuccess: (CloudEmployee) -> Unit,
         onError: (String) -> Unit
     ) {
@@ -189,6 +136,9 @@ object FirebaseManager {
 
         val cleanUserId =
             userId.trim().uppercase()
+
+        val cleanMobile = mobile.filter(Char::isDigit)
+        val mobileE164 = if (cleanMobile.length == 10) "+91$cleanMobile" else ""
 
         if (employeeUid.isBlank()) {
 
@@ -214,6 +164,11 @@ object FirebaseManager {
                 "Employee User ID required"
             )
 
+            return
+        }
+
+        if (mobileE164.isBlank()) {
+            onError("Employee mobile must be a valid 10 digit number")
             return
         }
 
@@ -263,6 +218,7 @@ object FirebaseManager {
                         employeeName = cleanName,
                         userId = cleanUserId,
                         authEmail = authEmail,
+                        mobileE164 = mobileE164,
                         role = "EMPLOYEE",
                         isActive = true,
                         createdAt =
@@ -284,6 +240,7 @@ object FirebaseManager {
                         "userId" to cleanUserId,
                         "employeeName" to cleanName,
                         "authEmail" to authEmail.trim().lowercase(),
+                        "mobileE164" to mobileE164,
                         "role" to "EMPLOYEE",
                         "isActive" to true,
                         "createdAt" to employee.createdAt,

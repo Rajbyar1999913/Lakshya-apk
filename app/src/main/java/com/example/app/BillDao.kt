@@ -13,6 +13,11 @@ interface BillDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertBill(bill: BillEntity)
 
+    // A cloud snapshot commonly contains many bills.  Persisting the complete
+    // snapshot in one Room operation avoids one database transaction per bill.
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertBills(bills: List<BillEntity>)
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertBillAndGetId(bill: BillEntity): Long
 

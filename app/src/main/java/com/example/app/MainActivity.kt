@@ -1,6 +1,7 @@
 package com.example.app
 
 import android.os.Build
+import android.app.Activity
 import android.icu.text.Transliterator
 
 import androidx.compose.runtime.rememberCoroutineScope
@@ -63,6 +64,12 @@ import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.TimeUnit
+import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.auth.PhoneAuthCredential
+import com.google.firebase.auth.PhoneAuthOptions
+import com.google.firebase.auth.PhoneAuthProvider
+import com.google.firebase.functions.FirebaseFunctions
 
 
 class MainActivity : ComponentActivity() {
@@ -487,6 +494,13 @@ val gameList = listOf(
     "MBC"
 )
 
+/** Fixed games plus every valid game used in this account's saved entries. */
+fun availableGames(savedEntries: List<SavedEntry>): List<String> =
+    (gameList + savedEntries.flatMap { it.games })
+        .map { it.trim().uppercase() }
+        .filter { it.isNotBlank() && isValidGameCode(it) }
+        .distinct()
+
 
 // =====================================================
 // DATA CLASSES
@@ -521,6 +535,8 @@ data class SavedEntry(
     val printedBy: String = "",
     val printedTime: Long? = null,
     val printCount: Int = 0,
+    // Stored with the slip so Master sees the same Employee Chukara eligibility.
+    val chukaraAllowedWithoutPrint: Boolean = false,
     val isDayLocked: Boolean = false,
     val dayLockedBy: String = "",
     val dayLockedTime: Long? = null
@@ -1058,6 +1074,14 @@ data class EmployeeChukaraPrintAccessConfig(
 object EmployeeChukaraPrintAccessRuntime {
     @Volatile
     var config: EmployeeChukaraPrintAccessConfig = EmployeeChukaraPrintAccessConfig()
+
+    // Used by the Master view to honour each employee's own print policy,
+    // including slips saved before this flag was added to CloudBill.
+    @Volatile
+    var withoutPrintByUserId: Map<String, Boolean> = emptyMap()
+
+    fun isWithoutPrintAllowed(employeeUserId: String): Boolean =
+        withoutPrintByUserId[employeeUserId.trim().uppercase()] == true
 }
 
 object EmployeeChukaraPrintAccessManager {
@@ -1267,6 +1291,38 @@ object EmployeeChukaraPrintAccessManager {
             }
             .addOnFailureListener {
                 onError(it.message ?: "Unable to load Employee Chukara print controls")
+            }
+    }
+
+    fun listenAllConfigs(
+        masterUid: String,
+        onUpdate: (List<EmployeeChukaraPrintAccessConfig>) -> Unit,
+        onError: (String) -> Unit = {}
+    ): com.google.firebase.firestore.ListenerRegistration? {
+        if (masterUid.isBlank()) {
+            onUpdate(emptyList())
+            return null
+        }
+
+        return firestore.collection("masters")
+            .document(masterUid)
+            .collection("employee_printer_controls")
+            .addSnapshotListener { snapshot, error ->
+                if (error != null) {
+                    onError(error.message ?: "Unable to sync employee Chukara controls")
+                    return@addSnapshotListener
+                }
+                onUpdate(snapshot?.documents.orEmpty().map { doc ->
+                    normalize(
+                        EmployeeChukaraPrintAccessConfig(
+                            employeeUid = doc.id,
+                            employeeUserId = doc.getString("employeeUserId").orEmpty(),
+                            employeeName = doc.getString("employeeName").orEmpty(),
+                            withPrint = doc.getBoolean("withPrint") ?: true,
+                            withoutPrint = doc.getBoolean("withoutPrint") ?: false
+                        )
+                    )
+                })
             }
     }
 }
@@ -2126,7 +2182,8 @@ object MasterAccessManager {
             // Do not use any "admins" collection.
             // Do not let old accessEnabled/accountStatus override this field.
             val accessEnabled =
-                masterDoc.getBoolean("isActive") == true
+                masterDoc.getBoolean("isActive") == true &&
+                        masterDoc.getString("role") == "ADMIN"
 
             // Read Firestore fields DIRECTLY.
             // Do not use toObject() here because Kotlin/Firebase boolean
@@ -2714,8 +2771,10 @@ fun LakshyaApp() {
     // =====================================================
     // AUTO LOGOUT - 20 MINUTES OF INACTIVITY
     // =====================================================
-    var lastUserActivityAt by remember {
-        mutableLongStateOf(System.currentTimeMillis())
+    // This value is read by the timeout coroutine only. Snapshot state here
+    // caused the entire app tree to recompose after every touch event.
+    val lastUserActivityAt = remember {
+        java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis())
     }
 
     val rootView = LocalView.current
@@ -2724,11 +2783,11 @@ fun LakshyaApp() {
         if (currentUserId.isBlank()) {
             onDispose { }
         } else {
-            lastUserActivityAt = System.currentTimeMillis()
+            lastUserActivityAt.set(System.currentTimeMillis())
 
             val touchListener =
                 android.view.View.OnTouchListener { _, _ ->
-                    lastUserActivityAt = System.currentTimeMillis()
+                    lastUserActivityAt.set(System.currentTimeMillis())
                     false
                 }
 
@@ -2742,13 +2801,13 @@ fun LakshyaApp() {
 
     LaunchedEffect(currentUserId) {
         if (currentUserId.isNotBlank()) {
-            lastUserActivityAt = System.currentTimeMillis()
+            lastUserActivityAt.set(System.currentTimeMillis())
 
             while (currentUserId.isNotBlank()) {
                 kotlinx.coroutines.delay(1000L)
 
                 if (
-                    System.currentTimeMillis() - lastUserActivityAt >=
+                    System.currentTimeMillis() - lastUserActivityAt.get() >=
                     20L * 60L * 1000L
                 ) {
                     val logoutUserId = currentUserId
@@ -2819,6 +2878,10 @@ fun LakshyaApp() {
     // =====================================================
     val publicScreens = remember {
         setOf(
+            // The decoy game is always the first screen, even when Firebase
+            // restores a previously signed-in session. Login remains behind
+            // its seven-tap unlock flow.
+            "game2048",
             "welcome",
             "publicDemo",
             "publicRegister",
@@ -3059,6 +3122,7 @@ fun LakshyaApp() {
             ChukaraPrintAccessRuntime.config = ChukaraPrintAccessConfig()
             ChukaraPrintAccessRuntime.configMasterUid = ""
             ChukaraPrintAccessRuntime.employeeWithoutPrintAllowed = true
+            EmployeeChukaraPrintAccessRuntime.withoutPrintByUserId = emptyMap()
             onDispose { }
         } else if (currentUserRole == "EMPLOYEE" && currentUserId.isNotBlank()) {
             val employeeUid =
@@ -3146,6 +3210,8 @@ fun LakshyaApp() {
                         ChukaraPrintAccessRuntime.configMasterUid = currentMasterUid
                         ChukaraPrintAccessRuntime.employeeWithoutPrintAllowed =
                             effectivePrint.withoutPrint
+                        EmployeeChukaraPrintAccessRuntime.withoutPrintByUserId =
+                            mapOf(currentUserId.trim().uppercase() to effectivePrint.withoutPrint)
                         chukaraRateRefresh++
                     }
 
@@ -3164,8 +3230,21 @@ fun LakshyaApp() {
                 },
                 onError = { }
             )
+            val employeeControlsRegistration =
+                EmployeeChukaraPrintAccessManager.listenAllConfigs(
+                    masterUid = currentMasterUid,
+                    onUpdate = { controls ->
+                        EmployeeChukaraPrintAccessRuntime.withoutPrintByUserId =
+                            controls.associate {
+                                it.employeeUserId.trim().uppercase() to it.withoutPrint
+                            }
+                        chukaraRateRefresh++
+                    },
+                    onError = { }
+                )
             onDispose {
                 registration?.remove()
+                employeeControlsRegistration?.remove()
             }
         }
     }
@@ -3297,6 +3376,8 @@ fun LakshyaApp() {
                                 printedBy = bill.printedBy,
                                 printedTime = bill.printedTime,
                                 printCount = bill.printCount,
+                                chukaraAllowedWithoutPrint =
+                                    bill.chukaraAllowedWithoutPrint,
                                 isDayLocked = bill.isDayLocked,
                                 dayLockedBy = bill.dayLockedBy,
                                 dayLockedTime = bill.dayLockedTime
@@ -3308,9 +3389,9 @@ fun LakshyaApp() {
 
                         // Rebuild the local Room cache after Clear Data/reinstall.
                         coroutineScope.launch(kotlinx.coroutines.Dispatchers.IO) {
-                            restored.forEach { entry ->
-                                try {
-                                    database.billDao().insertBill(
+                            try {
+                                database.billDao().insertBills(
+                                    restored.map { entry ->
                                         BillEntity(
                                             id = entry.id,
                                             masterUid = currentMasterUid,
@@ -3334,51 +3415,55 @@ fun LakshyaApp() {
                                             dayLockedBy = entry.dayLockedBy,
                                             dayLockedTime = entry.dayLockedTime
                                         )
-                                    )
-                                } catch (_: Exception) {
-                                }
+                                    }
+                                )
+                            } catch (_: Exception) {
+                                // Cloud data remains the source of truth; a cache failure
+                                // must never interrupt the active screen.
                             }
                         }
                     },
                     onError = { cloudError ->
-                        coroutineScope.launch {
+                        coroutineScope.launch(kotlinx.coroutines.Dispatchers.IO) {
                             val bills =
                                 database.billDao().getAllBills(currentMasterUid)
 
-                            savedEntries.clear()
-                            savedEntries.addAll(
-                                bills.map { bill ->
-                                    SavedEntry(
-                                        id = bill.id,
-                                        customerName = bill.customerName,
-                                        games = deserializeGames(bill.games),
-                                        entries = deserializeEntries(bill.entries),
-                                        perGameTotal = bill.perGameTotal,
-                                        grandTotal = bill.grandTotal,
-                                        savedTime = bill.savedTime,
-                                        status = bill.status,
-                                        createdBy = bill.createdBy,
-                                        cancelledBy = bill.cancelledBy,
-                                        cancelledTime = bill.cancelledTime,
-                                        isEdited = bill.isEdited,
-                                        lastEditedBy = bill.lastEditedBy,
-                                        lastEditedTime = bill.lastEditedTime,
-                                        isPrinted = bill.isPrinted,
-                                        printedBy = bill.printedBy,
-                                        printedTime = bill.printedTime,
-                                        isDayLocked = bill.isDayLocked,
-                                        dayLockedBy = bill.dayLockedBy,
-                                        dayLockedTime = bill.dayLockedTime
-                                    )
-                                }
-                            )
+                            val restored = bills.map { bill ->
+                                SavedEntry(
+                                    id = bill.id,
+                                    customerName = bill.customerName,
+                                    games = deserializeGames(bill.games),
+                                    entries = deserializeEntries(bill.entries),
+                                    perGameTotal = bill.perGameTotal,
+                                    grandTotal = bill.grandTotal,
+                                    savedTime = bill.savedTime,
+                                    status = bill.status,
+                                    createdBy = bill.createdBy,
+                                    cancelledBy = bill.cancelledBy,
+                                    cancelledTime = bill.cancelledTime,
+                                    isEdited = bill.isEdited,
+                                    lastEditedBy = bill.lastEditedBy,
+                                    lastEditedTime = bill.lastEditedTime,
+                                    isPrinted = bill.isPrinted,
+                                    printedBy = bill.printedBy,
+                                    printedTime = bill.printedTime,
+                                    isDayLocked = bill.isDayLocked,
+                                    dayLockedBy = bill.dayLockedBy,
+                                    dayLockedTime = bill.dayLockedTime
+                                )
+                            }
 
-                            if (bills.isEmpty()) {
-                                Toast.makeText(
-                                    context,
-                                    "Cloud restore failed: $cloudError",
-                                    Toast.LENGTH_LONG
-                                ).show()
+                            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                                savedEntries.clear()
+                                savedEntries.addAll(restored)
+
+                                if (bills.isEmpty()) {
+                                    Toast.makeText(
+                                        context,
+                                        "Cloud restore failed: $cloudError",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                }
                             }
                         }
                     }
@@ -4339,6 +4424,7 @@ fun LakshyaApp() {
                 }
             } else {
                 ExportGameSelectionScreen(
+                    availableGames = availableGames(todayEntries),
                     exportingGame = exportingGame,
                     onBack = {
                         if (exportingGame == null) {
@@ -4405,6 +4491,8 @@ fun LakshyaApp() {
                 database = database,
 
                 currentUserId = currentUserId,
+
+                currentUserRole = currentUserRole,
 
                 currentMasterUid = currentMasterUid,
 
@@ -4815,6 +4903,7 @@ fun LakshyaApp() {
 
 @Composable
 fun ExportGameSelectionScreen(
+    availableGames: List<String>,
     exportingGame: String?,
     onBack: () -> Unit,
     onGameSelected: (String) -> Unit
@@ -4847,7 +4936,7 @@ fun ExportGameSelectionScreen(
 
         Spacer(modifier = Modifier.height(24.dp))
 
-        gameList.chunked(2).forEach { rowGames ->
+        availableGames.chunked(2).forEach { rowGames ->
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(12.dp)
@@ -6764,6 +6853,12 @@ fun LoginScreen(
             mutableStateOf("")
         }
 
+        var newPassword by remember { mutableStateOf("") }
+        var confirmNewPassword by remember { mutableStateOf("") }
+        var otpSent by remember { mutableStateOf(false) }
+        var verificationId by remember { mutableStateOf("") }
+        var automaticCredential by remember { mutableStateOf<PhoneAuthCredential?>(null) }
+
         var resetLoading by remember {
             mutableStateOf(false)
         }
@@ -6932,18 +7027,45 @@ fun LoginScreen(
                                 keyboardType = KeyboardType.Number
                             ),
                             singleLine = true,
-                            enabled = false,
+                            enabled = otpSent && !resetLoading,
                             supportingText = {
                                 Text(
-                                    "OTP entry will activate after the secure recovery backend is connected."
+                                    if (otpSent) "OTP sent. Enter the 6-digit code."
+                                    else "Enter your new password, then tap Send OTP."
                                 )
                             }
                         )
 
                         Spacer(Modifier.height(10.dp))
 
+                        OutlinedTextField(
+                            value = newPassword,
+                            onValueChange = { newPassword = it },
+                            modifier = Modifier.fillMaxWidth(),
+                            label = { Text("New password (minimum 8 characters)") },
+                            visualTransformation = PasswordVisualTransformation(),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                            singleLine = true,
+                            enabled = !resetLoading
+                        )
+
+                        Spacer(Modifier.height(8.dp))
+
+                        OutlinedTextField(
+                            value = confirmNewPassword,
+                            onValueChange = { confirmNewPassword = it },
+                            modifier = Modifier.fillMaxWidth(),
+                            label = { Text("Confirm new password") },
+                            visualTransformation = PasswordVisualTransformation(),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                            singleLine = true,
+                            enabled = !resetLoading
+                        )
+
+                        Spacer(Modifier.height(10.dp))
+
                         Text(
-                            "For security, mobile OTP will not change a Firebase email/password account directly from the app. OTP verification and password update will be completed through the secure backend.",
+                            "Your phone number is verified by Firebase. The password is changed only by the secure backend after verification.",
                             fontSize = 12.sp,
                             color = Color.Gray
                         )
@@ -7054,17 +7176,84 @@ fun LoginScreen(
                                     Toast.LENGTH_SHORT
                                 ).show()
 
-                            } else {
+                            } else if (newPassword.length < 8) {
+                                Toast.makeText(context, "New password must have at least 8 characters", Toast.LENGTH_SHORT).show()
+                            } else if (newPassword != confirmNewPassword) {
+                                Toast.makeText(context, "Passwords do not match", Toast.LENGTH_SHORT).show()
+                            } else if (!otpSent) {
+                                val activity = context as? Activity
+                                if (activity == null) {
+                                    Toast.makeText(context, "Unable to start phone verification", Toast.LENGTH_LONG).show()
+                                    return@Button
+                                }
 
-                                Toast.makeText(
-                                    context,
-                                    "Mobile OTP recovery is ready in the app. Secure backend connection is required before OTP can be sent and used to reset the password.",
-                                    Toast.LENGTH_LONG
-                                ).show()
+                                resetLoading = true
+                                val callbacks = object : PhoneAuthProvider.OnVerificationStateChangedCallbacks() {
+                                    override fun onVerificationCompleted(credential: PhoneAuthCredential) {
+                                        automaticCredential = credential
+                                        resetLoading = false
+                                        otpSent = true
+                                        Toast.makeText(context, "Mobile number verified. Tap Reset Password.", Toast.LENGTH_LONG).show()
+                                    }
+
+                                    override fun onVerificationFailed(error: com.google.firebase.FirebaseException) {
+                                        resetLoading = false
+                                        Toast.makeText(context, error.message ?: "OTP could not be sent", Toast.LENGTH_LONG).show()
+                                    }
+
+                                    override fun onCodeSent(id: String, token: PhoneAuthProvider.ForceResendingToken) {
+                                        verificationId = id
+                                        automaticCredential = null
+                                        otpSent = true
+                                        resetLoading = false
+                                        Toast.makeText(context, "OTP sent to your mobile number", Toast.LENGTH_LONG).show()
+                                    }
+                                }
+                                PhoneAuthProvider.verifyPhoneNumber(
+                                    PhoneAuthOptions.newBuilder(FirebaseAuth.getInstance())
+                                        .setPhoneNumber("+91$resetMobile")
+                                        .setTimeout(60L, TimeUnit.SECONDS)
+                                        .setActivity(activity)
+                                        .setCallbacks(callbacks)
+                                        .build()
+                                )
+                            } else {
+                                val credential = automaticCredential ?: runCatching {
+                                    PhoneAuthProvider.getCredential(verificationId, otpCode)
+                                }.getOrNull()
+                                if (credential == null || (automaticCredential == null && otpCode.length != 6)) {
+                                    Toast.makeText(context, "Enter the 6-digit OTP", Toast.LENGTH_SHORT).show()
+                                    return@Button
+                                }
+
+                                resetLoading = true
+                                FirebaseAuth.getInstance().signInWithCredential(credential)
+                                    .addOnSuccessListener {
+                                        FirebaseFunctions.getInstance("asia-south1")
+                                            .getHttpsCallable("resetMasterPasswordByVerifiedPhone")
+                                            .call(mapOf("newPassword" to newPassword))
+                                            .addOnSuccessListener {
+                                                FirebaseAuth.getInstance().signOut()
+                                                resetLoading = false
+                                                showForgotPassword = false
+                                                Toast.makeText(context, "Password reset successfully. Please log in.", Toast.LENGTH_LONG).show()
+                                            }
+                                            .addOnFailureListener { error ->
+                                                FirebaseAuth.getInstance().signOut()
+                                                resetLoading = false
+                                                Toast.makeText(context, error.message ?: "Password reset failed", Toast.LENGTH_LONG).show()
+                                            }
+                                    }
+                                    .addOnFailureListener { error ->
+                                        resetLoading = false
+                                        Toast.makeText(context, error.message ?: "Invalid OTP", Toast.LENGTH_LONG).show()
+                                    }
                             }
-                        }
+                        },
+                        enabled = !resetLoading
                     ) {
-                        Text("SEND OTP")
+                        if (resetLoading) CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                        else Text(if (otpSent) "VERIFY & RESET" else "SEND OTP")
                     }
                 }
             },
@@ -11543,6 +11732,10 @@ fun ManageEmployeesScreen(
         mutableStateOf("")
     }
 
+    var employeeMobile by remember {
+        mutableStateOf("")
+    }
+
     val employees =
         remember {
             mutableStateListOf<EmployeeEntity>()
@@ -11763,6 +11956,18 @@ fun ManageEmployeesScreen(
             modifier = Modifier.fillMaxWidth()
         )
 
+        Spacer(modifier = Modifier.height(10.dp))
+
+        OutlinedTextField(
+            value = employeeMobile,
+            onValueChange = { employeeMobile = it.filter(Char::isDigit).take(10) },
+            label = { Text("Employee Mobile Number") },
+            supportingText = { Text("OTP password recovery will use this number") },
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth()
+        )
+
         Spacer(
             modifier = Modifier.height(10.dp)
         )
@@ -11806,6 +12011,8 @@ fun ManageEmployeesScreen(
                 val cleanPassword =
                     password.trim()
 
+                val cleanMobile = employeeMobile.filter(Char::isDigit)
+
                 when {
 
                     cleanName.isBlank() -> {
@@ -11832,6 +12039,14 @@ fun ManageEmployeesScreen(
                             context,
                             "ADMIN User ID is reserved",
                             Toast.LENGTH_LONG
+                        ).show()
+                    }
+
+                    cleanMobile.length != 10 -> {
+                        Toast.makeText(
+                            context,
+                            "Enter Employee's valid 10 digit mobile number",
+                            Toast.LENGTH_SHORT
                         ).show()
                     }
 
@@ -11927,6 +12142,7 @@ fun ManageEmployeesScreen(
                                                                 employeeName = cleanName,
                                                                 userId = cleanUserId,
                                                                 authEmail = employeeEmail,
+                                                                mobile = cleanMobile,
                                                                 onSuccess = {
                                                                     ChukaraEmployeeRealtimeSync.syncNewEmployee(
                                                                         masterUid = masterUid,
@@ -11944,6 +12160,7 @@ fun ManageEmployeesScreen(
                                                                     employeeName = ""
                                                                     userId = ""
                                                                     password = ""
+                                                                    employeeMobile = ""
                                                                     refreshEmployees()
 
                                                                     Toast.makeText(
@@ -13344,7 +13561,10 @@ fun exportLimitExcel(
 ): String {
     val activeEntries = savedEntries.filter { it.status == "ACTIVE" }
     val workbook = XSSFWorkbook()
-    gameList.forEach { game ->
+    val gamesToExport =
+        if (selectedGame.isNullOrBlank()) availableGames(activeEntries)
+        else listOf(selectedGame.trim().uppercase())
+    gamesToExport.forEach { game ->
         val sheet = workbook.createSheet(game)
         val gameEntries = activeEntries.filter { game in it.games }
         val totalCollection = gameEntries.sumOf { it.perGameTotal }
@@ -15449,6 +15669,8 @@ fun NewEntryScreen(
 
     currentUserId: String,
 
+    currentUserRole: String,
+
     currentMasterUid: String,
 
     initialSavedData: PrintPreviewData? = null,
@@ -16441,7 +16663,10 @@ fun NewEntryScreen(
                                 grandTotal = grandTotalToSave,
                                 savedTime = nowMs,
                                 status = "ACTIVE",
-                                createdBy = currentUserId
+                                createdBy = currentUserId,
+                                chukaraAllowedWithoutPrint =
+                                    currentUserRole == "EMPLOYEE" &&
+                                            ChukaraPrintAccessRuntime.employeeWithoutPrintAllowed
                             )
 
                             savedEntries.add(0, newSavedEntry)
@@ -18191,15 +18416,10 @@ fun GameWiseLimitScreen(
             android.content.Context.MODE_PRIVATE
         )
     }
-    val games = listOf(
-        "MO", "NO", "RDO", "KO",
-        "MC", "NC", "RDC", "KC",
-        "KNO", "RO", "MBO", "KNC",
-        "RC", "MBC"
-    )
+    val games = remember(savedEntries) { availableGames(savedEntries) }
 
     var selectedGame by remember {
-        mutableStateOf("MO")
+        mutableStateOf(games.firstOrNull().orEmpty())
     }
     var detailToShow by remember { mutableStateOf<String?>(null) }
 
@@ -18614,8 +18834,15 @@ fun calculateEntryChukara(
 ): List<WinningChukara> {
     if (savedEntry.status != "ACTIVE") return emptyList()
 
-    val printAccess = ChukaraPrintAccessRuntime.config
-    if (printAccess.withPrint && !printAccess.withoutPrint && !savedEntry.isPrinted) {
+    // The print policy is captured when an Employee creates the slip. This
+    // prevents the Master's own "with print" setting from hiding an
+    // Employee's permitted "without print" Chukara.
+    if (
+        !savedEntry.isPrinted &&
+        !savedEntry.chukaraAllowedWithoutPrint &&
+        !EmployeeChukaraPrintAccessRuntime
+            .isWithoutPrintAllowed(savedEntry.createdBy)
+    ) {
         return emptyList()
     }
 
