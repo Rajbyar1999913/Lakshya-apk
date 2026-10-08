@@ -24,6 +24,19 @@ interface BillDao {
     @Update
     suspend fun updateBill(bill: BillEntity)
 
+    /** A corrected version may print once even if the original was printed. */
+    @Query("""
+        UPDATE bills
+        SET isPrinted = 0,
+            printedBy = '',
+            printedTime = NULL
+        WHERE id = :billId
+        AND masterUid = :masterUid
+        AND status = 'ACTIVE'
+        AND isDayLocked = 0
+    """)
+    suspend fun unlockEditedBillForPrint(billId: Int, masterUid: String): Int
+
     @Query("""
         SELECT * FROM bills
         WHERE masterUid = :masterUid

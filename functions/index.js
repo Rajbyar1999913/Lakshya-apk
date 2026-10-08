@@ -446,3 +446,69 @@ exports.resetMasterPasswordByVerifiedPhone =
       };
     }
   );
+
+// =====================================================
+// LOGIN ID RECOVERY
+// The caller must first complete Firebase Phone Auth.  We never expose an
+// account identifier for an unverified phone number.
+// =====================================================
+
+exports.recoverLoginIdByVerifiedPhone =
+  onCall(
+    { region: "asia-south1" },
+    async (request) => {
+      if (!request.auth) {
+        throw new HttpsError("unauthenticated", "Phone verification is required.");
+      }
+
+      const phone = String(request.auth.token.phone_number || "").trim();
+      if (!phone) {
+        throw new HttpsError("failed-precondition", "Verified phone number was not found.");
+      }
+
+      const digits = phone.replace(/\D/g, "");
+      const mobile = digits.length === 12 && digits.startsWith("91")
+        ? digits.substring(2)
+        : digits;
+      if (mobile.length !== 10) {
+        throw new HttpsError("invalid-argument", "Invalid registered mobile number.");
+      }
+
+      const db = getFirestore();
+      const masterAccounts = await db
+        .collection("masters")
+        .where("mobile", "==", mobile)
+        .limit(2)
+        .get();
+
+      if (masterAccounts.size === 1) {
+        const user = await getAuth().getUser(masterAccounts.docs[0].id);
+        if (!user.email) {
+          throw new HttpsError("not-found", "Master login ID was not found.");
+        }
+        return { accountType: "MASTER", loginId: user.email };
+      }
+      if (masterAccounts.size > 1) {
+        throw new HttpsError("failed-precondition", "More than one account uses this mobile number.");
+      }
+
+      // Employee phones are stored in E.164 form in their cloud profile.
+      const employeeAccounts = await db
+        .collectionGroup("employees")
+        .where("mobileE164", "==", `+91${mobile}`)
+        .limit(2)
+        .get();
+      if (employeeAccounts.size === 1) {
+        const loginId = String(employeeAccounts.docs[0].get("userId") || "").trim();
+        if (!loginId) {
+          throw new HttpsError("not-found", "Employee login ID was not found.");
+        }
+        return { accountType: "EMPLOYEE", loginId };
+      }
+      if (employeeAccounts.size > 1) {
+        throw new HttpsError("failed-precondition", "More than one account uses this mobile number.");
+      }
+
+      throw new HttpsError("not-found", "No Lakshya account is registered with this mobile number.");
+    }
+  );

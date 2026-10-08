@@ -2,6 +2,10 @@ package com.example.app
 
 import android.os.Build
 import android.app.Activity
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color as AndroidColor
+import android.graphics.Paint
 import android.icu.text.Transliterator
 
 import androidx.compose.runtime.rememberCoroutineScope
@@ -52,7 +56,6 @@ import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
@@ -61,10 +64,13 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 import com.example.app.ui.theme.LakshyaTheme
 import java.io.FileOutputStream
+import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ThreadLocalRandom
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.ReentrantLock
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.PhoneAuthCredential
 import com.google.firebase.auth.PhoneAuthOptions
@@ -128,8 +134,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
-
-
 @Composable
 fun LakshyaBackendGate() {
 
@@ -494,9 +498,17 @@ val gameList = listOf(
     "MBC"
 )
 
-/** Fixed games plus every valid game used in this account's saved entries. */
+/**
+ * Fixed games plus every valid game used in this account's saved entries.
+ * A custom OPEN game automatically exposes its CLOSE partner too, so both
+ * games appear in lists and the close-side Jodi limit can be calculated.
+ */
 fun availableGames(savedEntries: List<SavedEntry>): List<String> =
-    (gameList + savedEntries.flatMap { it.games })
+    (gameList + savedEntries.flatMap { entry ->
+        entry.games.flatMap { game ->
+            listOfNotNull(game, closeGameForOpenGame(game))
+        }
+    })
         .map { it.trim().uppercase() }
         .filter { it.isNotBlank() && isValidGameCode(it) }
         .distinct()
@@ -552,6 +564,8 @@ data class MixedParseResult(
 
 data class PrintPreviewData(
     val billId: Int = 0,
+    // An edited receipt is a corrected copy and gets its own print slot.
+    val isEditedReceipt: Boolean = false,
     val customerName: String,
     val selectedGames: List<String>,
     val parsedEntries: List<NumberAmountEntry>,
@@ -559,6 +573,47 @@ data class PrintPreviewData(
     val date: String,
     val time: String
 )
+
+/**
+ * Room's auto-increment value starts again on a second phone after install or
+ * clear-data. Bills are shared through Firebase, therefore a device-local
+ * sequence can overwrite another phone's cached bill. New bills use a random
+ * positive ID so the same Master account can safely create slips on multiple
+ * phones, including while temporarily offline.
+ */
+private fun newSharedBillId(): Int =
+    ThreadLocalRandom.current()
+        .nextInt(1, Int.MAX_VALUE)
+
+// A locally persisted guard prevents a delayed cloud snapshot from briefly
+// bringing the Edit button back after the corrected receipt has printed.
+private fun editedPrintPrefs(
+    context: android.content.Context,
+    masterUid: String
+) = context.getSharedPreferences(
+    "lakshya_edited_printed_$masterUid",
+    android.content.Context.MODE_PRIVATE
+)
+
+private fun isEditConsumed(
+    context: android.content.Context,
+    masterUid: String,
+    billId: Int
+): Boolean = editedPrintPrefs(context, masterUid)
+    .getBoolean("EDITED_PRINTED_$billId", false)
+
+private fun markEditConsumed(
+    context: android.content.Context,
+    masterUid: String,
+    billId: Int
+) {
+    if (masterUid.isNotBlank() && billId > 0) {
+        editedPrintPrefs(context, masterUid)
+            .edit()
+            .putBoolean("EDITED_PRINTED_$billId", true)
+            .apply()
+    }
+}
 
 
 // =====================================================
@@ -2171,6 +2226,8 @@ object MasterAccessManager {
             masterRef.collection("subscription").document("current")
 
         // Read both exact documents used by Super Master activation.
+        // A transaction is used here because this project’s installed
+        // Firestore SDK does not provide the newer getAll() API.
         firestore.runTransaction { transaction ->
             val masterDoc = transaction.get(masterRef)
             val subscriptionDoc = transaction.get(subscriptionRef)
@@ -2217,7 +2274,6 @@ object MasterAccessManager {
             .addOnSuccessListener { result ->
                 val accessEnabled = result.first
                 val subscription = result.second
-                val now = System.currentTimeMillis()
 
                 if (
                     accessEnabled &&
@@ -2767,82 +2823,24 @@ fun LakshyaApp() {
         mutableStateOf(false)
     }
 
-
-    // =====================================================
-    // AUTO LOGOUT - 20 MINUTES OF INACTIVITY
-    // =====================================================
-    // This value is read by the timeout coroutine only. Snapshot state here
-    // caused the entire app tree to recompose after every touch event.
-    val lastUserActivityAt = remember {
-        java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis())
-    }
-
-    val rootView = LocalView.current
-
-    DisposableEffect(rootView, currentUserId) {
-        if (currentUserId.isBlank()) {
+    // A backend activation, expiry, or employee-limit update must reach an
+    // already-open app too; screen-entry fetches alone are not real-time.
+    DisposableEffect(currentMasterUid) {
+        if (currentMasterUid.isBlank()) {
             onDispose { }
         } else {
-            lastUserActivityAt.set(System.currentTimeMillis())
-
-            val touchListener =
-                android.view.View.OnTouchListener { _, _ ->
-                    lastUserActivityAt.set(System.currentTimeMillis())
-                    false
-                }
-
-            rootView.setOnTouchListener(touchListener)
-
-            onDispose {
-                rootView.setOnTouchListener(null)
-            }
+            val registration = CloudSubscriptionManager.listenSubscription(
+                masterUid = currentMasterUid,
+                onSuccess = { cloudSubscriptionData = it },
+                // Existing screen loads display actionable errors. Keep this
+                // background listener silent so a temporary network drop does
+                // not interrupt normal app use.
+                onError = { }
+            )
+            onDispose { registration?.remove() }
         }
     }
 
-    LaunchedEffect(currentUserId) {
-        if (currentUserId.isNotBlank()) {
-            lastUserActivityAt.set(System.currentTimeMillis())
-
-            while (currentUserId.isNotBlank()) {
-                kotlinx.coroutines.delay(1000L)
-
-                if (
-                    System.currentTimeMillis() - lastUserActivityAt.get() >=
-                    20L * 60L * 1000L
-                ) {
-                    val logoutUserId = currentUserId
-                    val logoutRole = currentUserRole
-                    val logoutMasterUid = currentMasterUid
-
-                    SingleDeviceSessionManager.release(
-                        context = context,
-                        masterUid = logoutMasterUid,
-                        role = logoutRole,
-                        userId = logoutUserId
-                    ) {
-                        com.google.firebase.auth.FirebaseAuth
-                            .getInstance()
-                            .signOut()
-
-                        currentUserId = ""
-                        currentUserRole = ""
-                        currentMasterUid = ""
-                        cloudSubscriptionData = null
-                        currentEmployeePermissions.clear()
-                        currentScreen = "login"
-
-                        Toast.makeText(
-                            context,
-                            "Automatically logged out after 20 minutes of inactivity.",
-                            Toast.LENGTH_LONG
-                        ).show()
-                    }
-
-                    break
-                }
-            }
-        }
-    }
 
     // =====================================================
     // IQ200 - SINGLE DEVICE SESSION HEARTBEAT
@@ -3384,42 +3382,51 @@ fun LakshyaApp() {
                             )
                         }
 
-                        savedEntries.clear()
-                        savedEntries.addAll(restored)
+                        // Firestore emits snapshots both from its cache and again
+                        // after the server confirms the same data. Avoid clearing
+                        // every Compose list and rewriting the entire Room cache
+                        // when that second snapshot contains no actual change.
+                        if (restored != savedEntries.toList()) {
+                            savedEntries.clear()
+                            savedEntries.addAll(restored)
 
-                        // Rebuild the local Room cache after Clear Data/reinstall.
-                        coroutineScope.launch(kotlinx.coroutines.Dispatchers.IO) {
-                            try {
-                                database.billDao().insertBills(
-                                    restored.map { entry ->
-                                        BillEntity(
-                                            id = entry.id,
-                                            masterUid = currentMasterUid,
-                                            customerName = entry.customerName,
-                                            games = serializeGames(entry.games),
-                                            entries = serializeEntries(entry.entries),
-                                            perGameTotal = entry.perGameTotal,
-                                            grandTotal = entry.grandTotal,
-                                            savedTime = entry.savedTime,
-                                            status = entry.status,
-                                            createdBy = entry.createdBy,
-                                            cancelledBy = entry.cancelledBy,
-                                            cancelledTime = entry.cancelledTime,
-                                            isEdited = entry.isEdited,
-                                            lastEditedBy = entry.lastEditedBy,
-                                            lastEditedTime = entry.lastEditedTime,
-                                            isPrinted = entry.isPrinted,
-                                            printedBy = entry.printedBy,
-                                            printedTime = entry.printedTime,
-                                            isDayLocked = entry.isDayLocked,
-                                            dayLockedBy = entry.dayLockedBy,
-                                            dayLockedTime = entry.dayLockedTime
-                                        )
-                                    }
-                                )
-                            } catch (_: Exception) {
-                                // Cloud data remains the source of truth; a cache failure
-                                // must never interrupt the active screen.
+                            // Rebuild the local Room cache after Clear Data/reinstall.
+                            coroutineScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                                try {
+                                    database.billDao().insertBills(
+                                        restored.map { entry ->
+                                            BillEntity(
+                                                id = entry.id,
+                                                masterUid = currentMasterUid,
+                                                customerName = entry.customerName,
+                                                games = serializeGames(entry.games),
+                                                entries = serializeEntries(entry.entries),
+                                                perGameTotal = entry.perGameTotal,
+                                                grandTotal = entry.grandTotal,
+                                                savedTime = entry.savedTime,
+                                                status = entry.status,
+                                                createdBy = entry.createdBy,
+                                                cancelledBy = entry.cancelledBy,
+                                                cancelledTime = entry.cancelledTime,
+                                                isEdited = entry.isEdited,
+                                                lastEditedBy = entry.lastEditedBy,
+                                                lastEditedTime = entry.lastEditedTime,
+                                                isPrinted = entry.isPrinted,
+                                                printedBy = entry.printedBy,
+                                                printedTime = entry.printedTime,
+                                                printCount = entry.printCount,
+                                                chukaraAllowedWithoutPrint =
+                                                    entry.chukaraAllowedWithoutPrint,
+                                                isDayLocked = entry.isDayLocked,
+                                                dayLockedBy = entry.dayLockedBy,
+                                                dayLockedTime = entry.dayLockedTime
+                                            )
+                                        }
+                                    )
+                                } catch (_: Exception) {
+                                    // Cloud data remains the source of truth; a cache failure
+                                    // must never interrupt the active screen.
+                                }
                             }
                         }
                     },
@@ -3447,6 +3454,9 @@ fun LakshyaApp() {
                                     isPrinted = bill.isPrinted,
                                     printedBy = bill.printedBy,
                                     printedTime = bill.printedTime,
+                                    printCount = bill.printCount,
+                                    chukaraAllowedWithoutPrint =
+                                        bill.chukaraAllowedWithoutPrint,
                                     isDayLocked = bill.isDayLocked,
                                     dayLockedBy = bill.dayLockedBy,
                                     dayLockedTime = bill.dayLockedTime
@@ -4671,10 +4681,40 @@ fun LakshyaApp() {
                             "DAY CLOSED: This entry is permanently locked",
                             Toast.LENGTH_LONG
                         ).show()
+                    } else if (entry.isEdited) {
+                        Toast.makeText(
+                            context,
+                            "This entry is already edited. Only Cancel is available.",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    } else if (isEditConsumed(context, currentMasterUid, entry.id)) {
+                        Toast.makeText(
+                            context,
+                            "This edited receipt was already printed. Only Cancel is available.",
+                            Toast.LENGTH_LONG
+                        ).show()
                     } else {
                         entryToEdit = entry
                         currentScreen = "editEntry"
                     }
+                },
+
+                onPrintEditedEntry = { entry ->
+                    val receiptDate = Date(entry.savedTime)
+                    printPreviewData = PrintPreviewData(
+                        billId = entry.id,
+                        isEditedReceipt = true,
+                        customerName = entry.customerName,
+                        selectedGames = entry.games,
+                        parsedEntries = entry.entries,
+                        grandTotal = entry.grandTotal,
+                        date = SimpleDateFormat("dd-MM-yyyy", Locale.getDefault())
+                            .format(receiptDate),
+                        time = SimpleDateFormat("hh:mm:ss a", Locale.getDefault())
+                            .format(receiptDate)
+                    )
+                    printPreviewReturnScreen = "searchReports"
+                    currentScreen = "printPreview"
                 },
 
                 onBack = {
@@ -4712,17 +4752,28 @@ fun LakshyaApp() {
                     onPrinted = { billId, printedBy, printedTime ->
                         val index = savedEntries.indexOfFirst { it.id == billId }
                         if (index >= 0) {
+                            val wasEdited = savedEntries[index].isEdited
                             savedEntries[index] = savedEntries[index].copy(
                                 isPrinted = true,
                                 printedBy = printedBy,
                                 printedTime = printedTime
                             )
+                            if (wasEdited) {
+                                markEditConsumed(context, currentMasterUid, billId)
+                            }
                         }
-                        entryToEdit = entryToEdit?.takeIf { it.id != billId } ?: entryToEdit?.copy(
-                            isPrinted = true,
-                            printedBy = printedBy,
-                            printedTime = printedTime
-                        )
+                        entryToEdit = entryToEdit?.let { activeEdit ->
+                            if (activeEdit.id == billId) {
+                                if (activeEdit.isEdited) {
+                                    markEditConsumed(context, currentMasterUid, billId)
+                                }
+                                activeEdit.copy(
+                                    isPrinted = true,
+                                    printedBy = printedBy,
+                                    printedTime = printedTime
+                                )
+                            } else activeEdit
+                        }
 
                         // A receipt printed from New Entry starts a fresh form
                         // immediately, ready for the next customer's bill.
@@ -5949,10 +6000,14 @@ fun LoginScreen(
     var showCreateAccount by remember { mutableStateOf(false) }
     var showForgotId by remember { mutableStateOf(false) }
     var showForgotPassword by remember { mutableStateOf(false) }
+    var showBackendRecovery by remember { mutableStateOf(false) }
     var showContact by remember { mutableStateOf(false) }
     var showAbout by remember { mutableStateOf(false) }
     var showPrivacy by remember { mutableStateOf(false) }
     var showTerms by remember { mutableStateOf(false) }
+    var phoneToLink by remember { mutableStateOf("") }
+    var showPhoneLink by remember { mutableStateOf(false) }
+    var afterPhoneLink by remember { mutableStateOf<(() -> Unit)?>(null) }
 
     val background = Color(0xFF07111F)
     val surface = Color(0xFF0D1B2D)
@@ -5960,6 +6015,12 @@ fun LoginScreen(
     val gold = Color(0xFFE0B84C)
     val softGold = Color(0xFFFFDF7A)
     val muted = Color(0xFF9EADBF)
+
+    // OTP recovery is intentionally disabled until the billing-backed backend
+    // is available. Password login must remain independent of phone setup.
+    fun requireLinkedPhone(registeredPhone: String, onReady: () -> Unit) {
+        onReady()
+    }
 
     Box(
         modifier = Modifier
@@ -6115,14 +6176,14 @@ fun LoginScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         TextButton(
-                            onClick = { showForgotId = true },
+                            onClick = { showBackendRecovery = true },
                             contentPadding = PaddingValues(0.dp)
                         ) {
                             Text("Forgot User ID?", color = softGold, fontSize = 12.sp)
                         }
                         Spacer(Modifier.weight(1f))
                         TextButton(
-                            onClick = { showForgotPassword = true },
+                            onClick = { showBackendRecovery = true },
                             contentPadding = PaddingValues(0.dp)
                         ) {
                             Text("Forgot Password?", color = softGold, fontSize = 12.sp)
@@ -6156,6 +6217,15 @@ fun LoginScreen(
                                                     ?.uid
                                                     .orEmpty()
 
+                                            com.google.firebase.firestore.FirebaseFirestore
+                                                .getInstance()
+                                                .collection("masters")
+                                                .document(masterUid)
+                                                .get()
+                                                .addOnSuccessListener { masterProfile ->
+                                                    requireLinkedPhone(
+                                                        masterProfile.getString("mobile").orEmpty()
+                                                    ) {
                                             MasterAccessManager.verifyMasterAccess(
                                                 masterUid = masterUid,
                                                 onAllowed = { cloudSubscription ->
@@ -6242,6 +6312,15 @@ fun LoginScreen(
                                                     ).show()
                                                 }
                                             )
+                                                    }
+                                                }
+                                                .addOnFailureListener { error ->
+                                                    Toast.makeText(
+                                                        context,
+                                                        error.message ?: "Could not read registered mobile number",
+                                                        Toast.LENGTH_LONG
+                                                    ).show()
+                                                }
                                         },
                                         onError = { message ->
                                             Toast.makeText(
@@ -6441,6 +6520,7 @@ fun LoginScreen(
                                                                     }
 
                                                                     // Login success only after ALL checks pass.
+                                                                    requireLinkedPhone(cloudEmployee.mobileE164) {
                                                                     SingleDeviceSessionManager.acquire(
                                                                         context = context,
                                                                         masterUid = masterUid,
@@ -6482,6 +6562,7 @@ fun LoginScreen(
                                                                             ).show()
                                                                         }
                                                                     )
+                                                                    }
                                                                 }
                                                                 .addOnFailureListener { error ->
                                                                     com.google.firebase.auth.FirebaseAuth
@@ -6782,13 +6863,20 @@ fun LoginScreen(
 
     if (showForgotId) {
         var mobile by remember { mutableStateOf("") }
+        var otpCode by remember { mutableStateOf("") }
+        var otpSent by remember { mutableStateOf(false) }
+        var verificationId by remember { mutableStateOf("") }
+        var automaticCredential by remember { mutableStateOf<PhoneAuthCredential?>(null) }
+        var recoveryLoading by remember { mutableStateOf(false) }
 
         AlertDialog(
-            onDismissRequest = { showForgotId = false },
+            onDismissRequest = {
+                if (!recoveryLoading) showForgotId = false
+            },
             title = { Text("Forgot User ID?") },
             text = {
                 Column {
-                    Text("Enter your registered mobile number.")
+                    Text("Verify your registered mobile number with OTP to recover your Login ID.")
                     Spacer(Modifier.height(14.dp))
                     OutlinedTextField(
                         value = mobile,
@@ -6804,6 +6892,18 @@ fun LoginScreen(
                         ),
                         singleLine = true
                     )
+                    if (otpSent) {
+                        Spacer(Modifier.height(12.dp))
+                        OutlinedTextField(
+                            value = otpCode,
+                            onValueChange = { otpCode = it.filter(Char::isDigit).take(6) },
+                            modifier = Modifier.fillMaxWidth(),
+                            label = { Text("6-digit OTP") },
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            singleLine = true,
+                            enabled = !recoveryLoading
+                        )
+                    }
                 }
             },
             confirmButton = {
@@ -6815,20 +6915,95 @@ fun LoginScreen(
                                 "Enter valid mobile number",
                                 Toast.LENGTH_SHORT
                             ).show()
+                        } else if (!otpSent) {
+                            val activity = context as? Activity
+                            if (activity == null) {
+                                Toast.makeText(context, "Unable to start phone verification", Toast.LENGTH_LONG).show()
+                                return@Button
+                            }
+                            recoveryLoading = true
+                            PhoneAuthProvider.verifyPhoneNumber(
+                                PhoneAuthOptions.newBuilder(FirebaseAuth.getInstance())
+                                    .setPhoneNumber("+91$mobile")
+                                    .setTimeout(60L, TimeUnit.SECONDS)
+                                    .setActivity(activity)
+                                    .setCallbacks(object : PhoneAuthProvider.OnVerificationStateChangedCallbacks() {
+                                        override fun onVerificationCompleted(credential: PhoneAuthCredential) {
+                                            automaticCredential = credential
+                                            otpSent = true
+                                            recoveryLoading = false
+                                            Toast.makeText(context, "Mobile verified. Tap FIND USER ID.", Toast.LENGTH_LONG).show()
+                                        }
+                                        override fun onVerificationFailed(error: com.google.firebase.FirebaseException) {
+                                            recoveryLoading = false
+                                            Toast.makeText(context, error.message ?: "OTP could not be sent", Toast.LENGTH_LONG).show()
+                                        }
+                                        override fun onCodeSent(id: String, token: PhoneAuthProvider.ForceResendingToken) {
+                                            verificationId = id
+                                            automaticCredential = null
+                                            otpSent = true
+                                            recoveryLoading = false
+                                            Toast.makeText(context, "OTP sent to your mobile number", Toast.LENGTH_LONG).show()
+                                        }
+                                    })
+                                    .build()
+                            )
                         } else {
-                            Toast.makeText(
-                                context,
-                                "User ID recovery will work after mobile verification is connected.",
-                                Toast.LENGTH_LONG
-                            ).show()
+                            val credential = automaticCredential ?: if (otpCode.length == 6) {
+                                runCatching { PhoneAuthProvider.getCredential(verificationId, otpCode) }.getOrNull()
+                            } else null
+                            if (credential == null) {
+                                Toast.makeText(context, "Enter the 6-digit OTP", Toast.LENGTH_SHORT).show()
+                                return@Button
+                            }
+                            recoveryLoading = true
+                            FirebaseAuth.getInstance().signInWithCredential(credential)
+                                .addOnSuccessListener { result ->
+                                    val user = result.user
+                                    if (user?.email.isNullOrBlank()) {
+                                        // Do not leave behind a phone-only Firebase account. It
+                                        // would otherwise prevent this number being linked later.
+                                        user?.delete()
+                                        FirebaseAuth.getInstance().signOut()
+                                        recoveryLoading = false
+                                        Toast.makeText(context, "This mobile is not linked to a Lakshya account. Please sign in once and verify your mobile.", Toast.LENGTH_LONG).show()
+                                        return@addOnSuccessListener
+                                    }
+                                    // Employee ID is stored in the signed-in employee's own lookup.
+                                    com.google.firebase.firestore.FirebaseFirestore.getInstance()
+                                        .collection("employee_lookup")
+                                        .document(user!!.uid)
+                                        .get()
+                                        .addOnSuccessListener { lookup ->
+                                            val recoveredId = lookup.getString("userId") ?: user.email.orEmpty()
+                                            FirebaseAuth.getInstance().signOut()
+                                            recoveryLoading = false
+                                            loginId = recoveredId
+                                            showForgotId = false
+                                            Toast.makeText(context, "Your Login ID is: $recoveredId", Toast.LENGTH_LONG).show()
+                                        }
+                                        .addOnFailureListener {
+                                            FirebaseAuth.getInstance().signOut()
+                                            recoveryLoading = false
+                                            loginId = user.email.orEmpty()
+                                            showForgotId = false
+                                            Toast.makeText(context, "Your Login ID is: ${user.email}", Toast.LENGTH_LONG).show()
+                                        }
+                                }
+                                .addOnFailureListener { error ->
+                                    recoveryLoading = false
+                                    Toast.makeText(context, error.message ?: "Invalid OTP", Toast.LENGTH_LONG).show()
+                                }
                         }
-                    }
+                    },
+                    enabled = !recoveryLoading
                 ) {
-                    Text("FIND USER ID")
+                    if (recoveryLoading) CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                    else Text(if (otpSent) "VERIFY & FIND ID" else "SEND OTP")
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showForgotId = false }) {
+                TextButton(onClick = { showForgotId = false }, enabled = !recoveryLoading) {
                     Text("CANCEL")
                 }
             }
@@ -7228,10 +7403,20 @@ fun LoginScreen(
 
                                 resetLoading = true
                                 FirebaseAuth.getInstance().signInWithCredential(credential)
-                                    .addOnSuccessListener {
-                                        FirebaseFunctions.getInstance("asia-south1")
-                                            .getHttpsCallable("resetMasterPasswordByVerifiedPhone")
-                                            .call(mapOf("newPassword" to newPassword))
+                                    .addOnSuccessListener { result ->
+                                        val user = result.user
+                                        if (user?.email.isNullOrBlank()) {
+                                            // Remove the temporary phone-only account created when
+                                            // a number has not yet been linked to Lakshya.
+                                            user?.delete()
+                                            FirebaseAuth.getInstance().signOut()
+                                            resetLoading = false
+                                            Toast.makeText(context, "This mobile is not linked to a Lakshya account. Please sign in once and verify your mobile.", Toast.LENGTH_LONG).show()
+                                            return@addOnSuccessListener
+                                        }
+                                        // Phone OTP is a recent sign-in for this linked Firebase user,
+                                        // so Firebase permits updating only this user's own password.
+                                        user!!.updatePassword(newPassword.trim())
                                             .addOnSuccessListener {
                                                 FirebaseAuth.getInstance().signOut()
                                                 resetLoading = false
@@ -7266,6 +7451,25 @@ fun LoginScreen(
                     enabled = !resetLoading
                 ) {
                     Text("CANCEL")
+                }
+            }
+        )
+    }
+
+    if (showBackendRecovery) {
+        AlertDialog(
+            onDismissRequest = { showBackendRecovery = false },
+            title = { Text("Login ID / Password Recovery") },
+            text = {
+                Text(
+                    "Mobile OTP recovery is currently unavailable. " +
+                        "For a Master/Admin or Employee Login ID or password change, " +
+                        "please contact the Backend / Super Master Admin."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { showBackendRecovery = false }) {
+                    Text("OK")
                 }
             }
         )
@@ -8056,6 +8260,9 @@ fun OldDayBackupScreen(
                                 isPrinted = bill.isPrinted,
                                 printedBy = bill.printedBy,
                                 printedTime = bill.printedTime,
+                                printCount = bill.printCount,
+                                chukaraAllowedWithoutPrint =
+                                    bill.chukaraAllowedWithoutPrint,
                                 isDayLocked = bill.isDayLocked,
                                 dayLockedBy = bill.dayLockedBy,
                                 dayLockedTime = bill.dayLockedTime
@@ -8193,7 +8400,7 @@ fun OldDayBackupScreen(
         }
 
     val gameTotals =
-        gameList.associateWith {
+        availableGames(activeEntries).associateWith {
                 game ->
 
             activeEntries.sumOf {
@@ -8854,7 +9061,7 @@ fun OldDayBackupScreen(
 
                 } else {
 
-                    gameList
+                    availableGames(backupEntries)
                         .chunked(2)
                         .forEach {
                                 rowGames ->
@@ -13297,9 +13504,11 @@ fun TodayDashboardScreen(
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
 
+    val games = remember(savedEntries) { availableGames(savedEntries) }
+
     val gameTotals =
 
-        gameList.associateWith { game ->
+        games.associateWith { game ->
 
             savedEntries.sumOf { savedEntry ->
 
@@ -13370,7 +13579,7 @@ fun TodayDashboardScreen(
         )
 
 
-        gameList.forEach { game ->
+        games.forEach { game ->
 
 
             Card(
@@ -14067,6 +14276,8 @@ fun SearchReportsScreen(
 
     onEditEntry: (SavedEntry) -> Unit,
 
+    onPrintEditedEntry: (SavedEntry) -> Unit,
+
     onBack: () -> Unit
 
 ) {
@@ -14078,6 +14289,11 @@ fun SearchReportsScreen(
     // print-control configuration changes. The calculation below reads
     // ChukaraPrintAccessRuntime, which is a non-Compose runtime object.
     chukaraPrintAccessRefresh
+
+    // A Master configured for Chukara WITH PRINT must print every corrected
+    // report. WITHOUT PRINT keeps its existing behaviour.
+    val correctedReceiptRequired =
+        !ChukaraPrintAccessRuntime.config.withoutPrint
 
     fun employeeAllowed(key: String): Boolean =
         currentUserRole == "ADMIN" ||
@@ -14929,7 +15145,12 @@ fun SearchReportsScreen(
 
                             if (savedEntry.status == "ACTIVE") {
 
-                                if (!editLocked && employeeAllowed("EDIT_ENTRY")) {
+                                if (
+                                    !savedEntry.isEdited &&
+                                    !isEditConsumed(context, currentMasterUid, savedEntry.id) &&
+                                    !editLocked &&
+                                    employeeAllowed("EDIT_ENTRY")
+                                ) {
                                     Button(
                                         onClick = {
                                             onEditEntry(savedEntry)
@@ -14949,12 +15170,30 @@ fun SearchReportsScreen(
                                             hasDeclaredResult ->
                                                 "🔒 LOCKED - RESULT DECLARED"
 
+                                            savedEntry.isEdited ||
+                                                    isEditConsumed(context, currentMasterUid, savedEntry.id) ->
+                                                "✏️ EDITED - ONLY CANCEL IS AVAILABLE"
+
                                             else ->
                                                 "🔒 PRINTED - EDIT LOCKED"
                                         },
                                         fontSize = 14.sp
                                     )
 
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                }
+
+                                if (
+                                    correctedReceiptRequired &&
+                                    savedEntry.isEdited &&
+                                    !savedEntry.isPrinted
+                                ) {
+                                    Button(
+                                        onClick = { onPrintEditedEntry(savedEntry) },
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Text("PRINT EDITED RECEIPT")
+                                    }
                                     Spacer(modifier = Modifier.height(8.dp))
                                 }
 
@@ -15202,6 +15441,36 @@ fun EditEntryScreen(
         mutableStateOf(entry)
     }
 
+    // Exactly one edit is allowed. After it is saved, fields lock but the
+    // updated slip remains available for printing.
+    val editCompleted = entry.isEdited || latestSavedEntry.isEdited
+
+    // The report state is shared by every device using this Master ID.  Keep
+    // the corrected receipt locked until Firestore confirms the edit; if we
+    // printed first, another phone could receive only the print state and
+    // still show the old report/edit option.
+    val editedReceiptReadyToPrint =
+        latestUpdateSaved &&
+                latestSavedEntry.isEdited &&
+                !latestSavedEntry.isPrinted
+
+    // Only Master IDs configured for Chukara WITH PRINT have to finish the
+    // corrected receipt before leaving this report-edit flow.
+    val correctedReceiptRequired =
+        !ChukaraPrintAccessRuntime.config.withoutPrint
+    val correctedReceiptPending =
+        correctedReceiptRequired &&
+                latestSavedEntry.isEdited &&
+                !latestSavedEntry.isPrinted
+
+    androidx.activity.compose.BackHandler(enabled = correctedReceiptPending) {
+        Toast.makeText(
+            context,
+            "Print the edited receipt before leaving this report.",
+            Toast.LENGTH_LONG
+        ).show()
+    }
+
     LaunchedEffect(entry.isPrinted, entry.printedTime) {
         if (entry.isPrinted) {
             latestSavedEntry = entry
@@ -15313,7 +15582,8 @@ fun EditEntryScreen(
                 latestUpdateSaved = false
             },
             label = { Text("Customer Name") },
-            modifier = Modifier.fillMaxWidth()
+            modifier = Modifier.fillMaxWidth(),
+            enabled = !editCompleted && !isUpdating
         )
 
         Spacer(modifier = Modifier.height(10.dp))
@@ -15325,7 +15595,8 @@ fun EditEntryScreen(
                 latestUpdateSaved = false
             },
             label = { Text("Game Name") },
-            modifier = Modifier.fillMaxWidth()
+            modifier = Modifier.fillMaxWidth(),
+            enabled = !editCompleted && !isUpdating
         )
 
         Spacer(modifier = Modifier.height(10.dp))
@@ -15341,7 +15612,8 @@ fun EditEntryScreen(
             },
             modifier = Modifier
                 .fillMaxWidth()
-                .height(220.dp)
+                .height(220.dp),
+            enabled = !editCompleted && !isUpdating
         )
 
         Spacer(modifier = Modifier.height(12.dp))
@@ -15358,6 +15630,14 @@ fun EditEntryScreen(
         Button(
             onClick = {
                 when {
+                    editCompleted -> {
+                        Toast.makeText(
+                            context,
+                            "This entry was already edited. Only Cancel is available.",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+
                     entryResultLocked() -> {
                         Toast.makeText(
                             context,
@@ -15494,6 +15774,8 @@ fun EditEntryScreen(
                                     printedBy = "",
                                     printedTime = null,
                                     printCount = oldSaved.printCount,
+                                    chukaraAllowedWithoutPrint =
+                                        oldSaved.chukaraAllowedWithoutPrint,
                                     isDayLocked = oldSaved.isDayLocked,
                                     dayLockedBy = oldSaved.dayLockedBy,
                                     dayLockedTime = oldSaved.dayLockedTime
@@ -15538,6 +15820,10 @@ fun EditEntryScreen(
                                         entry = updatedSavedEntry,
                                         masterUid = currentMasterUid,
                                         onSuccess = {
+                                            // Firestore has accepted the edit,
+                                            // so every phone with this Master
+                                            // ID receives isEdited=true before
+                                            // the corrected receipt can print.
                                             latestUpdateSaved = true
                                             Toast.makeText(
                                                 context,
@@ -15556,7 +15842,6 @@ fun EditEntryScreen(
                                     )
                                 }
                             } catch (e: Exception) {
-                                latestUpdateSaved = false
                                 Toast.makeText(
                                     context,
                                     "Update Failed: ${e.message}",
@@ -15572,6 +15857,7 @@ fun EditEntryScreen(
             enabled =
                 !latestUpdateSaved &&
                         !isUpdating &&
+                        !editCompleted &&
                         !entry.isDayLocked &&
                         !entryResultLocked(),
             modifier = Modifier
@@ -15594,6 +15880,7 @@ fun EditEntryScreen(
                 onPrintPreview(
                     PrintPreviewData(
                         billId = saved.id,
+                        isEditedReceipt = saved.isEdited,
                         customerName = saved.customerName,
                         selectedGames = saved.games,
                         parsedEntries = saved.entries,
@@ -15610,8 +15897,7 @@ fun EditEntryScreen(
                 )
             },
             enabled =
-                latestUpdateSaved &&
-                        !latestSavedEntry.isPrinted &&
+                editedReceiptReadyToPrint &&
                         !isUpdating &&
                         !entry.isDayLocked &&
                         !entryResultLocked(),
@@ -15625,19 +15911,32 @@ fun EditEntryScreen(
             )
         }
 
-        if (!latestUpdateSaved) {
+        if (editedReceiptReadyToPrint) {
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = "PRINT locked - pehle UPDATE / SAVE karein",
+                text = "Edited entry saved - PRINT RECEIPT is ready",
                 fontSize = 12.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
+                color = MaterialTheme.colorScheme.primary
             )
         } else {
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = "Latest changes saved - PRINT ready",
+                text = if (editCompleted) {
+                    "Edited receipt has already been printed. Only Cancel is available."
+                } else {
+                    "After one edit, the corrected receipt can be printed once."
+                },
                 fontSize = 12.sp,
-                color = MaterialTheme.colorScheme.primary
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+
+        if (correctedReceiptPending) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = "PRINT RECEIPT is compulsory for this Master ID.",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.error
             )
         }
 
@@ -15645,7 +15944,8 @@ fun EditEntryScreen(
 
         OutlinedButton(
             onClick = onBack,
-            modifier = Modifier.fillMaxWidth()
+            modifier = Modifier.fillMaxWidth(),
+            enabled = !correctedReceiptPending
         ) {
             Text(text = "BACK TO HISTORY")
         }
@@ -16627,6 +16927,7 @@ fun NewEntryScreen(
                                 ) {
                                     database.billDao().insertBillAndGetId(
                                         BillEntity(
+                                            id = newSharedBillId(),
                                             masterUid = currentMasterUid,
                                             customerName = customerToSave,
                                             games = serializeGames(gamesToSave),
@@ -16635,7 +16936,11 @@ fun NewEntryScreen(
                                             grandTotal = grandTotalToSave,
                                             savedTime = nowMs,
                                             status = "ACTIVE",
-                                            createdBy = currentUserId
+                                            createdBy = currentUserId,
+                                            chukaraAllowedWithoutPrint =
+                                                ChukaraPrintAccessRuntime
+                                                    .config
+                                                    .withoutPrint
                                         )
                                     ).toInt()
                                 }
@@ -16665,8 +16970,9 @@ fun NewEntryScreen(
                                 status = "ACTIVE",
                                 createdBy = currentUserId,
                                 chukaraAllowedWithoutPrint =
-                                    currentUserRole == "EMPLOYEE" &&
-                                            ChukaraPrintAccessRuntime.employeeWithoutPrintAllowed
+                                    ChukaraPrintAccessRuntime
+                                        .config
+                                        .withoutPrint
                             )
 
                             savedEntries.add(0, newSavedEntry)
@@ -16786,9 +17092,87 @@ fun NewEntryScreen(
 private const val PRINTER_PREFS = "lakshya_printer"
 private const val PRINTER_MAC = "printer_mac"
 private val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
+// A Bluetooth thermal printer accepts only one byte stream at a time.  Without
+// this guard a receipt and a test/second receipt can interleave at the printer,
+// leaving some models in a repeating-print state.
+private val printerJobLock = ReentrantLock()
 
 private fun normalizedPrinterId(value: String): String =
     value.trim().uppercase().replace(":", "").replace("-", "").replace(" ", "")
+
+/**
+ * ESC/POS printers generally do not contain a Hindi font. Sending UTF-8 text
+ * therefore makes Devanagari letters appear as Chinese/garbled characters.
+ * Render the slip as a monochrome raster so Hindi prints exactly as Android
+ * draws it, independent of the printer's built-in font.
+ */
+private fun escPosRasterReceipt(text: String): ByteArray {
+    val width = 384 // Standard 58 mm thermal printer printable width.
+    val padding = 8
+    val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = AndroidColor.BLACK
+        // Compact but legible on 58 mm thermal paper. Normal weight plus a
+        // softer raster threshold prevents Hindi letters from looking bold.
+        textSize = 21f
+        typeface = android.graphics.Typeface.create("sans-serif", android.graphics.Typeface.NORMAL)
+        isFakeBoldText = false
+        strokeWidth = 0f
+    }
+    val maxWidth = width - padding * 2
+    val lines = mutableListOf<String>()
+    text.lines().forEach { original ->
+        var remaining = original
+        if (remaining.isEmpty()) {
+            lines += ""
+        } else {
+            while (remaining.isNotEmpty()) {
+                val count = paint.breakText(remaining, true, maxWidth.toFloat(), null)
+                    .coerceAtLeast(1)
+                lines += remaining.take(count)
+                remaining = remaining.drop(count)
+            }
+        }
+    }
+    val lineHeight = 28
+    val height = (lines.size * lineHeight + padding * 2).coerceAtLeast(1)
+    val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+    Canvas(bitmap).apply {
+        drawColor(AndroidColor.WHITE)
+        lines.forEachIndexed { index, line ->
+            drawText(line, padding.toFloat(), padding + 21f + index * lineHeight, paint)
+        }
+    }
+
+    val bytesPerRow = (width + 7) / 8
+    val raster = ByteArrayOutputStream()
+    raster.write(byteArrayOf(0x1B, 0x40)) // ESC @ initialize
+    raster.write(byteArrayOf(0x1D, 0x76, 0x30, 0x00)) // GS v 0, normal raster mode
+    raster.write(bytesPerRow and 0xFF)
+    raster.write((bytesPerRow shr 8) and 0xFF)
+    raster.write(height and 0xFF)
+    raster.write((height shr 8) and 0xFF)
+    for (y in 0 until height) {
+        for (byteIndex in 0 until bytesPerRow) {
+            var value = 0
+            for (bit in 0..7) {
+                val x = byteIndex * 8 + bit
+                // Preserve only the darker part of anti-aliased glyphs. If
+                // every grey edge pixel is printed black, thermal receipts
+                // look unnecessarily thick/bolder than the Android preview.
+                if (
+                    x < width &&
+                            AndroidColor.red(bitmap.getPixel(x, y)) < 170
+                ) {
+                    value = value or (0x80 shr bit)
+                }
+            }
+            raster.write(value)
+        }
+    }
+    raster.write(byteArrayOf(10, 10, 10))
+    bitmap.recycle()
+    return raster.toByteArray()
+}
 
 @SuppressLint("MissingPermission")
 fun hasBluetoothConnectPermission(context: android.content.Context): Boolean {
@@ -16805,6 +17189,10 @@ fun sendTextToSavedPrinter(
     expectedUserRole: String = ""
 ): Result<Unit> {
     return runCatching {
+        if (!printerJobLock.tryLock()) {
+            error("Printer is busy. Please wait for the current print to finish.")
+        }
+        try {
         if (!hasBluetoothConnectPermission(context)) error("Bluetooth permission not allowed")
         val adapter = BluetoothAdapter.getDefaultAdapter() ?: error("Bluetooth not supported")
         if (!adapter.isEnabled) error("Bluetooth is OFF")
@@ -16877,10 +17265,18 @@ fun sendTextToSavedPrinter(
         device.createRfcommSocketToServiceRecord(SPP_UUID).use { socket ->
             socket.connect()
             socket.outputStream.use { out ->
-                out.write(text.toByteArray(Charsets.UTF_8))
-                out.write(byteArrayOf(10, 10, 10))
+                val containsHindi = text.any { it in '\u0900'..'\u097F' }
+                if (containsHindi) {
+                    out.write(escPosRasterReceipt(text))
+                } else {
+                    out.write(text.toByteArray(Charsets.UTF_8))
+                    out.write(byteArrayOf(10, 10, 10))
+                }
                 out.flush()
             }
+        }
+        } finally {
+            printerJobLock.unlock()
         }
     }
 }
@@ -17253,6 +17649,25 @@ fun PrintPreviewScreen(
 
     LaunchedEffect(data.billId, currentMasterUid) {
         if (data.billId > 0 && currentMasterUid.isNotBlank()) {
+            val existingBill =
+                database.billDao().getBillById(data.billId, currentMasterUid)
+            // Original receipt = printCount 1. Corrected receipt = printCount
+            // 2. This also protects another device where the local preference
+            // marker is not present yet.
+            val correctedPrintAlreadyUsed =
+                isEditConsumed(context, currentMasterUid, data.billId) ||
+                        (existingBill?.printCount ?: 0) >= 2
+            if (
+                data.isEditedReceipt &&
+                        !correctedPrintAlreadyUsed
+            ) {
+                // The original version may already be printed. Before this
+                // corrected preview opens, explicitly unlock one print slot.
+                database.billDao().unlockEditedBillForPrint(
+                    billId = data.billId,
+                    masterUid = currentMasterUid
+                )
+            }
             val bill = database.billDao().getBillById(data.billId, currentMasterUid)
             printed = bill?.isPrinted == true
             printCount = bill?.printCount ?: 0
@@ -17620,6 +18035,8 @@ fun PrintPreviewScreen(
 
                     buildReceiptText(
 
+                        slipNumber = data.billId,
+
                         customerName =
                             data.customerName,
 
@@ -17646,6 +18063,27 @@ fun PrintPreviewScreen(
                         Toast.makeText(context, "Invalid Slip ID", Toast.LENGTH_LONG).show()
                         return@launch
                     }
+
+                    // A corrected (edited) receipt always gets exactly one
+                    // fresh print slot. Do this again at tap time as well as
+                    // preview-load time, so an old Firestore/local snapshot
+                    // can never bring back the original print lock.
+                    val currentBill =
+                        database.billDao().getBillById(data.billId, currentMasterUid)
+                    val correctedPrintAlreadyUsed =
+                        isEditConsumed(context, currentMasterUid, data.billId) ||
+                                (currentBill?.printCount ?: 0) >= 2
+                    if (
+                        data.isEditedReceipt &&
+                                !correctedPrintAlreadyUsed
+                    ) {
+                        database.billDao().unlockEditedBillForPrint(
+                            billId = data.billId,
+                            masterUid = currentMasterUid
+                        )
+                        printed = false
+                    }
+
                     val printedTime = System.currentTimeMillis()
                     // Lock first: duplicate taps cannot reach the printer.
                     val reserved = database.billDao().markBillPrinted(
@@ -18250,6 +18688,8 @@ private fun hindiSlipCustomerName(name: String): String {
 
 fun buildReceiptText(
 
+    slipNumber: Int,
+
     customerName: String,
 
     selectedGames:
@@ -18285,17 +18725,9 @@ fun buildReceiptText(
     )
 
 
+    receipt.appendLine("SLIP NO: #$slipNumber")
     receipt.appendLine(
-        "Customer: ${hindiSlipCustomerName(customerName)}"
-    )
-
-
-    receipt.appendLine(
-
-        "Games: ${
-            selectedGames.joinToString(", ")
-        }"
-
+        "CUSTOMER - ${hindiSlipCustomerName(customerName)}     GAME - ${selectedGames.joinToString(", ")}"
     )
 
 
@@ -18416,7 +18848,20 @@ fun GameWiseLimitScreen(
             android.content.Context.MODE_PRIVATE
         )
     }
-    val games = remember(savedEntries) { availableGames(savedEntries) }
+    // Include result-created games as well as games that already have an
+    // entry. This lets a new OPEN/CLOSE pair appear here before its first
+    // customer entry is saved.
+    val games = remember(savedEntries, currentMasterUid) {
+        val storedGames = resultPrefs
+            .getStringSet(LIVE_RESULT_GAMES_KEY, emptySet())
+            .orEmpty()
+        (availableGames(savedEntries) + storedGames.flatMap { game ->
+            listOfNotNull(game, closeGameForOpenGame(game))
+        })
+            .map { it.trim().uppercase() }
+            .filter(::isValidGameCode)
+            .distinct()
+    }
 
     var selectedGame by remember {
         mutableStateOf(games.firstOrNull().orEmpty())
@@ -18834,14 +19279,15 @@ fun calculateEntryChukara(
 ): List<WinningChukara> {
     if (savedEntry.status != "ACTIVE") return emptyList()
 
-    // The print policy is captured when an Employee creates the slip. This
-    // prevents the Master's own "with print" setting from hiding an
-    // Employee's permitted "without print" Chukara.
+    // Capture the print policy when a slip is created. This applies to both
+    // Master and Employee IDs, so a Master made WITHOUT PRINT by Super Master
+    // is not incorrectly filtered from Chukara.
     if (
         !savedEntry.isPrinted &&
         !savedEntry.chukaraAllowedWithoutPrint &&
         !EmployeeChukaraPrintAccessRuntime
-            .isWithoutPrintAllowed(savedEntry.createdBy)
+            .isWithoutPrintAllowed(savedEntry.createdBy) &&
+        !ChukaraPrintAccessRuntime.config.withoutPrint
     ) {
         return emptyList()
     }
@@ -19031,7 +19477,8 @@ fun syncLiveResultsToPrefs(
 
 
 fun closeGameForOpenGame(openGame: String): String? {
-    return when (openGame) {
+    val game = openGame.trim().uppercase()
+    return when (game) {
         "MO" -> "MC"
         "NO" -> "NC"
         "RDO" -> "RDC"
@@ -19039,13 +19486,19 @@ fun closeGameForOpenGame(openGame: String): String? {
         "KNO" -> "KNC"
         "RO" -> "RC"
         "MBO" -> "MBC"
-        else -> null
+        // New games follow the same OPEN-to-CLOSE naming rule as RDO/RDC:
+        // replace the final O with C (for example RNO -> RNC).
+        else -> game
+            .takeIf { isValidGameCode(it) && it.endsWith("O") }
+            ?.dropLast(1)
+            ?.plus("C")
     }
 }
 
 
 fun openGameForCloseGame(closeGame: String): String? {
-    return when (closeGame) {
+    val game = closeGame.trim().uppercase()
+    return when (game) {
         "MC" -> "MO"
         "NC" -> "NO"
         "RDC" -> "RDO"
@@ -19053,7 +19506,10 @@ fun openGameForCloseGame(closeGame: String): String? {
         "KNC" -> "KNO"
         "RC" -> "RO"
         "MBC" -> "MBO"
-        else -> null
+        else -> game
+            .takeIf { isValidGameCode(it) && it.endsWith("C") }
+            ?.dropLast(1)
+            ?.plus("O")
     }
 }
 
@@ -20161,6 +20617,26 @@ fun ResultScreen(
                     if (isValidGameCode(code)) {
                         selectedGame = code
                         if (code !in games) games.add(code)
+                        // Creating an OPEN game also creates its CLOSE game
+                        // immediately (for example RNO -> RNC).
+                        closeGameForOpenGame(code)?.let { closeGame ->
+                            if (closeGame !in games) games.add(closeGame)
+                            if (closeGame !in results) results[closeGame] =
+                                prefs.getString(closeGame, "").orEmpty()
+                        }
+                        val pairedGames = listOfNotNull(
+                            code,
+                            closeGameForOpenGame(code)
+                        )
+                        prefs.edit()
+                            .putStringSet(
+                                LIVE_RESULT_GAMES_KEY,
+                                prefs.getStringSet(
+                                    LIVE_RESULT_GAMES_KEY,
+                                    emptySet()
+                                ).orEmpty() + pairedGames
+                            )
+                            .apply()
                         resultInput = results[code].orEmpty()
                     }
                 },
@@ -20671,6 +21147,7 @@ fun ProfitLossScreen(
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
+
             .padding(24.dp)
     ) {
         Spacer(modifier = Modifier.height(25.dp))

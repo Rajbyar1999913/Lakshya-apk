@@ -2,6 +2,9 @@
   "name": "lakshya-release-publisher",
   "private": true,
   "main": "index.js",
+  "scripts": {
+    "credentials:admin": "node admin-credentials.js"
+  },
   "engines": {
     "node": "20"
   },

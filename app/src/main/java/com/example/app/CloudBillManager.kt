@@ -680,6 +680,16 @@ object CloudBillManager {
                                         CloudBill::class.java
                                     )
                                     ?.copy(
+                                        // Kotlin/Firebase versions have used
+                                        // both `edited` and `isEdited` for an
+                                        // `isEdited` Boolean property. Read
+                                        // both so an edit done on one phone
+                                        // always hides the Edit action on the
+                                        // other phone too.
+                                        isEdited =
+                                            document.getBoolean("isEdited")
+                                                ?: document.getBoolean("edited")
+                                                ?: false,
                                         // Older app versions saved this as
                                         // "printed". Read both fields so a
                                         // cloud refresh cannot remove a
@@ -772,6 +782,14 @@ object CloudBillManager {
                                 CloudBill::class.java
                             )
                             ?.copy(
+                                isEdited =
+                                    document.getBoolean("isEdited")
+                                        ?: document.getBoolean("edited")
+                                        ?: false,
+                                isPrinted =
+                                    document.getBoolean("isPrinted")
+                                        ?: document.getBoolean("printed")
+                                        ?: false,
                                 cloudBillId =
                                     document.id
                             )

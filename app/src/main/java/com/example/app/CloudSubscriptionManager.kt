@@ -1,6 +1,7 @@
 package com.example.app
 
 import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.ListenerRegistration
 
 data class CloudSubscriptionData(
 
@@ -45,6 +46,42 @@ object CloudSubscriptionManager {
             .document(masterUid)
             .collection("subscription")
             .document("current")
+
+    private fun readSubscription(
+        document: com.google.firebase.firestore.DocumentSnapshot
+    ): CloudSubscriptionData = CloudSubscriptionData(
+        startDate = document.getLong("startDate") ?: 0L,
+        expiryDate = document.getLong("expiryDate") ?: 0L,
+        employeeLimit = (document.getLong("employeeLimit") ?: 5L).toInt(),
+        // Keep plan pricing derived from the limit for legacy accounts too.
+        monthlyPrice = monthlyPlanPriceFor(
+            (document.getLong("employeeLimit") ?: 5L).toInt()
+        ),
+        isActive = document.getBoolean("isActive") ?: false,
+        updatedAt = document.getLong("updatedAt") ?: 0L
+    )
+
+    /** Keeps an already-open app in sync with backend plan changes. */
+    fun listenSubscription(
+        masterUid: String,
+        onSuccess: (CloudSubscriptionData) -> Unit,
+        onError: (String) -> Unit = {}
+    ): ListenerRegistration? {
+        if (masterUid.isBlank()) return null
+
+        return subscriptionDocument(masterUid)
+            .addSnapshotListener { document, error ->
+                if (error != null) {
+                    onError(error.message ?: "Subscription sync failed")
+                    return@addSnapshotListener
+                }
+                if (document == null || !document.exists()) {
+                    onError("Subscription not found")
+                    return@addSnapshotListener
+                }
+                onSuccess(readSubscription(document))
+            }
+    }
 
 
     // =====================================================
@@ -96,58 +133,7 @@ object CloudSubscriptionManager {
                 // -----------------------------------------
 
                 try {
-
-                    val startDate =
-                        document.getLong("startDate")
-                            ?: 0L
-
-
-                    val expiryDate =
-                        document.getLong("expiryDate")
-                            ?: 0L
-
-
-                    val employeeLimit =
-                        (
-                                document.getLong("employeeLimit")
-                                    ?: 5L
-                                ).toInt()
-
-
-                    // Legacy accounts may still contain the former ₹5,000
-                    // value. Derive the price from the plan limit so every
-                    // 5-employee plan consistently displays ₹10,000.
-                    val monthlyPrice = monthlyPlanPriceFor(employeeLimit)
-
-
-                    val isActive =
-                        document.getBoolean("isActive")
-                            ?: false
-
-
-                    val updatedAt =
-                        document.getLong("updatedAt")
-                            ?: 0L
-
-
-                    val data =
-                        CloudSubscriptionData(
-
-                            startDate = startDate,
-
-                            expiryDate = expiryDate,
-
-                            employeeLimit = employeeLimit,
-
-                            monthlyPrice = monthlyPrice,
-
-                            isActive = isActive,
-
-                            updatedAt = updatedAt
-                        )
-
-
-                    onSuccess(data)
+                    onSuccess(readSubscription(document))
 
                 } catch (e: Exception) {
 

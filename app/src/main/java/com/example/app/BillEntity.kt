@@ -34,6 +34,9 @@ data class BillEntity(
     val printedTime: Long? = null,
     val printCount: Int = 0,
 
+    // Keeps employee "without print" Chukara eligibility in the offline cache.
+    val chukaraAllowedWithoutPrint: Boolean = false,
+
     val isDayLocked: Boolean = false,
     val dayLockedBy: String = "",
     val dayLockedTime: Long? = null
