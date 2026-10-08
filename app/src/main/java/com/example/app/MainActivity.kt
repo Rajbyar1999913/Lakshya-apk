@@ -9376,6 +9376,37 @@ fun SuperMasterScreen(
         loadFirstPage()
     }
 
+    // Keep the newest customer page current while Super Master is viewing it.
+    // This lets a newly registered Master ID appear without leaving the screen
+    // or relying on a manual refresh.
+    val signedInUid = com.google.firebase.auth.FirebaseAuth
+        .getInstance().currentUser?.uid.orEmpty()
+    DisposableEffect(signedInUid) {
+        if (signedInUid != LAKSHYA_SUPER_MASTER_UID) {
+            onDispose { }
+        } else {
+            var isInitialSnapshot = true
+            val registration = com.google.firebase.firestore.FirebaseFirestore
+                .getInstance()
+                .collection("masters")
+                .orderBy(
+                    "createdAt",
+                    com.google.firebase.firestore.Query.Direction.DESCENDING
+                )
+                .limit(25)
+                .addSnapshotListener { _, error ->
+                    if (error != null) {
+                        errorMessage = error.message ?: "Unable to sync new Master IDs"
+                    } else if (isInitialSnapshot) {
+                        isInitialSnapshot = false
+                    } else {
+                        refreshKey++
+                    }
+                }
+            onDispose { registration.remove() }
+        }
+    }
+
     val query =
         searchText.trim().lowercase()
 
@@ -17170,6 +17201,9 @@ private fun escPosRasterReceipt(text: String): ByteArray {
         }
     }
     raster.write(byteArrayOf(10, 10, 10))
+    // Finish the receipt explicitly. Printers with an auto-cutter will cut;
+    // models without one safely ignore the cut command after feeding paper.
+    raster.write(byteArrayOf(0x1D, 0x56, 0x00)) // GS V 0: full cut
     bitmap.recycle()
     return raster.toByteArray()
 }
@@ -17271,6 +17305,7 @@ fun sendTextToSavedPrinter(
                 } else {
                     out.write(text.toByteArray(Charsets.UTF_8))
                     out.write(byteArrayOf(10, 10, 10))
+                    out.write(byteArrayOf(0x1D, 0x56, 0x00)) // End receipt / cut
                 }
                 out.flush()
             }
