@@ -2,10 +2,6 @@ package com.example.app
 
 import android.os.Build
 import android.app.Activity
-import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.graphics.Color as AndroidColor
-import android.graphics.Paint
 import android.icu.text.Transliterator
 
 import androidx.compose.runtime.rememberCoroutineScope
@@ -64,7 +60,6 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 import com.example.app.ui.theme.LakshyaTheme
 import java.io.FileOutputStream
-import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -3906,6 +3901,9 @@ fun LakshyaApp() {
                     cloudSubscriptionData = subscription
                     currentScreen = "subscription"
                 },
+                onCreateMasterAccount = {
+                    currentScreen = "publicRegister"
+                },
                 onBack = {
                     currentScreen = "welcome"
                 }
@@ -5985,6 +5983,7 @@ fun LoginScreen(
     database: AppDatabase,
     onLoginSuccess: (String, String, String) -> Unit,
     onMasterPlanExpired: (String, CloudSubscriptionData) -> Unit,
+    onCreateMasterAccount: () -> Unit,
     onBack: () -> Unit
 ) {
     BackHandler {
@@ -6658,20 +6657,40 @@ fun LoginScreen(
 
                     Spacer(Modifier.height(7.dp))
 
+                    Button(
+                        onClick = onCreateMasterAccount,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(52.dp),
+                        shape = RoundedCornerShape(14.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = gold,
+                            contentColor = Color(0xFF071426)
+                        )
+                    ) {
+                        Text(
+                            text = "CREATE MASTER / BUSINESS ACCOUNT",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp
+                        )
+                    }
+
+                    Spacer(Modifier.height(8.dp))
+
                     OutlinedButton(
                         onClick = { showCreateAccount = true },
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(52.dp),
+                            .height(48.dp),
                         shape = RoundedCornerShape(14.dp),
                         colors = ButtonDefaults.outlinedButtonColors(
                             contentColor = softGold
                         )
                     ) {
                         Text(
-                            text = "CREATE NEW ACCOUNT",
+                            text = "CREATE EMPLOYEE ACCOUNT",
                             fontWeight = FontWeight.Bold,
-                            fontSize = 13.sp
+                            fontSize = 12.sp
                         )
                     }
                 }
@@ -17132,80 +17151,32 @@ private fun normalizedPrinterId(value: String): String =
     value.trim().uppercase().replace(":", "").replace("-", "").replace(" ", "")
 
 /**
- * ESC/POS printers generally do not contain a Hindi font. Sending UTF-8 text
- * therefore makes Devanagari letters appear as Chinese/garbled characters.
- * Render the slip as a monochrome raster so Hindi prints exactly as Android
- * draws it, independent of the printer's built-in font.
+ * Keep receipt payloads compatible with basic ESC/POS text printers. Many
+ * inexpensive 58 mm models print GS v 0 bitmap bytes as random characters,
+ * so Devanagari is transliterated to Latin and any remaining non-ASCII glyphs
+ * are replaced before the payload is sent.
  */
-private fun escPosRasterReceipt(text: String): ByteArray {
-    val width = 384 // Standard 58 mm thermal printer printable width.
-    val padding = 8
-    val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = AndroidColor.BLACK
-        // Compact but legible on 58 mm thermal paper. Normal weight plus a
-        // softer raster threshold prevents Hindi letters from looking bold.
-        textSize = 21f
-        typeface = android.graphics.Typeface.create("sans-serif", android.graphics.Typeface.NORMAL)
-        isFakeBoldText = false
-        strokeWidth = 0f
-    }
-    val maxWidth = width - padding * 2
-    val lines = mutableListOf<String>()
-    text.lines().forEach { original ->
-        var remaining = original
-        if (remaining.isEmpty()) {
-            lines += ""
+private fun printerCompatibleReceipt(text: String): String {
+    val latinText = try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            Transliterator.getInstance("Devanagari-Latin").transliterate(text)
         } else {
-            while (remaining.isNotEmpty()) {
-                val count = paint.breakText(remaining, true, maxWidth.toFloat(), null)
-                    .coerceAtLeast(1)
-                lines += remaining.take(count)
-                remaining = remaining.drop(count)
-            }
+            text
         }
-    }
-    val lineHeight = 28
-    val height = (lines.size * lineHeight + padding * 2).coerceAtLeast(1)
-    val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-    Canvas(bitmap).apply {
-        drawColor(AndroidColor.WHITE)
-        lines.forEachIndexed { index, line ->
-            drawText(line, padding.toFloat(), padding + 21f + index * lineHeight, paint)
-        }
+    } catch (_: Exception) {
+        text
     }
 
-    val bytesPerRow = (width + 7) / 8
-    val raster = ByteArrayOutputStream()
-    raster.write(byteArrayOf(0x1B, 0x40)) // ESC @ initialize
-    raster.write(byteArrayOf(0x1D, 0x76, 0x30, 0x00)) // GS v 0, normal raster mode
-    raster.write(bytesPerRow and 0xFF)
-    raster.write((bytesPerRow shr 8) and 0xFF)
-    raster.write(height and 0xFF)
-    raster.write((height shr 8) and 0xFF)
-    for (y in 0 until height) {
-        for (byteIndex in 0 until bytesPerRow) {
-            var value = 0
-            for (bit in 0..7) {
-                val x = byteIndex * 8 + bit
-                // Preserve only the darker part of anti-aliased glyphs. If
-                // every grey edge pixel is printed black, thermal receipts
-                // look unnecessarily thick/bolder than the Android preview.
-                if (
-                    x < width &&
-                            AndroidColor.red(bitmap.getPixel(x, y)) < 170
-                ) {
-                    value = value or (0x80 shr bit)
+    return buildString(latinText.length) {
+        latinText.forEach { char ->
+            append(
+                when {
+                    char.code in 0x20..0x7E || char == '\n' || char == '\r' || char == '\t' || char == '\u001B' -> char
+                    else -> '?'
                 }
-            }
-            raster.write(value)
+            )
         }
     }
-    raster.write(byteArrayOf(10, 10, 10))
-    // Finish the receipt explicitly. Printers with an auto-cutter will cut;
-    // models without one safely ignore the cut command after feeding paper.
-    raster.write(byteArrayOf(0x1D, 0x56, 0x00)) // GS V 0: full cut
-    bitmap.recycle()
-    return raster.toByteArray()
 }
 
 @SuppressLint("MissingPermission")
@@ -17299,14 +17270,9 @@ fun sendTextToSavedPrinter(
         device.createRfcommSocketToServiceRecord(SPP_UUID).use { socket ->
             socket.connect()
             socket.outputStream.use { out ->
-                val containsHindi = text.any { it in '\u0900'..'\u097F' }
-                if (containsHindi) {
-                    out.write(escPosRasterReceipt(text))
-                } else {
-                    out.write(text.toByteArray(Charsets.UTF_8))
-                    out.write(byteArrayOf(10, 10, 10))
-                    out.write(byteArrayOf(0x1D, 0x56, 0x00)) // End receipt / cut
-                }
+                out.write(printerCompatibleReceipt(text).toByteArray(Charsets.US_ASCII))
+                out.write(byteArrayOf(10, 10, 10))
+                out.write(byteArrayOf(0x1D, 0x56, 0x00)) // End receipt / cut
                 out.flush()
             }
         }
